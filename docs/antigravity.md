@@ -75,20 +75,26 @@ because it cannot verify that those quotas belong to that account. Settings expl
 To try the local app or `agy` account instead, select **Local API / agy CLI** (CLI: `--source cli`).
 That source may use a different signed-in account from the Google account selected in CodexBar; it does not verify a match.
 
-## OAuth account switching
+## OAuth account switching and account-scoped `agy`
 
 - OAuth refresh form-encodes credential values, preserving literal plus signs, separators, and percent escapes.
-- Login still uses Antigravity's Google OAuth client, discovered from `Antigravity.app` or overridden with `ANTIGRAVITY_OAUTH_CLIENT_ID` and `ANTIGRAVITY_OAUTH_CLIENT_SECRET`.
+- Login resolves its Google OAuth client in this order: `ANTIGRAVITY_OAUTH_CLIENT_ID`/`ANTIGRAVITY_OAUTH_CLIENT_SECRET` overrides, then the pair discovered inside the installed `agy` binary, then the pair discovered from `Antigravity.app`/`Gemini.app`. Quota eligibility and onboarding are bound to the client that minted the credential: `agy`-backed fetching and the Code Assist quota endpoints only accept grants minted by the `agy` CLI's own client, so logins prefer that pair when the binary is present.
 - A successful login writes the latest shared credentials to `~/.codexbar/antigravity/oauth_creds.json` and upserts a token-account entry for the Google account.
 - Each token-account entry stores serialized `AntigravityOAuthCredentials` and is injected into remote fetches through `ANTIGRAVITY_OAUTH_CREDENTIALS_JSON`.
-- When a token account is selected, the OAuth fetcher uses that account before falling back to the shared credentials file.
-  In `auto` mode the ambient Antigravity app, `agy` CLI, and IDE probes still run first, but a snapshot whose account
-  does not match the selected account is rejected so the pipeline falls through to the account-scoped OAuth fetch (see
-  `AntigravitySelectedAccountGuard`). If no account is selected/injected, `auto` includes OAuth only when the legacy
-  shared credentials file already exists. Explicit `cli`/`oauth` source modes stay authoritative and are not re-checked.
+- When a token account is selected in `auto` mode:
+  - CodexBar first checks if an ambient Antigravity app, running `agy` CLI, or IDE extension already matches the selected account's email. If so, it reuses that ambient instance as-is.
+  - When ambient sources are not running or belong to a different account, CodexBar performs an account-scoped `agy` print fetch (on macOS) using the saved OAuth credentials for the selected account to retrieve rich quota and reset times (`RetrieveUserQuotaSummary` via `agy -p /usage --output-format json`).
+  - Staging `HOME` instead of Keychain: under a cross-process lock (`~/.codexbar/antigravity/agy-credential.lock`), `AntigravityAgyHomeCoordinator` writes the selected account's OAuth token into `agy`'s file token storage inside an isolated per-account `HOME` (`~/.codexbar/antigravity/accounts/<key>/home/.gemini/antigravity-cli/antigravity-oauth-token`, mode 0600). The child runs with `HOME`/`PWD` pointed at that directory and a non-empty `SSH_TTY`, which makes `agy` select file-based token storage outright — it neither reads nor writes the user's OS keyring, so no Keychain prompt can ever appear.
+  - Persistent per-account staging: the staging `HOME` is kept between fetches so tokens `agy` refreshes itself stay warm. A staged token with a later expiry is never overwritten by an older injected credential, but only while it belongs to the same grant (matching refresh token); a staged token from different credentials is always replaced, and a newer injected credential replaces it too.
+  - No cross-account process reuse: any CodexBar-managed `agy` session is reset before and after the scoped run, and the scoped fetch itself is a one-shot print process that exits on completion.
+  - Identity by construction: `agy` print reports carry no account email, so the staged account's email is attached to the result and the existing `AntigravitySelectedAccountGuard` accepts it.
+  - Fallback to remote OAuth: if the account-scoped `agy` probe fails, times out, or the credentials lack required fields, the pipeline falls through to direct Google OAuth remote fetch.
+  - Actionable diagnostics: `agy` stderr is never surfaced raw, but known signatures are classified — an eligibility/TOS rejection becomes "account has not accepted the Gemini Code Assist terms for this OAuth client" and an auth rejection becomes "CLI is signed out". The remote OAuth path classifies the same eligibility signature in 403 bodies, so a credential minted by the wrong OAuth client surfaces an actionable error instead of "Limits not available".
+  - Explicit `--source cli`: CLI source mode remains strictly bound to the user's ambient login and never stages account environments.
+  - Platform limitation: account-scoped `agy` execution relies on `agy`'s file token storage path and is macOS-only.
 - Removing the last saved token account that matches `~/.codexbar/antigravity/oauth_creds.json` deletes that shared file,
   so a removed CodexBar account does not silently continue refreshing through the legacy shared cache.
-- The menu action is labeled `Add Account...`; switching between saved accounts scopes Google OAuth fetches.
+- The menu action is labeled `Add Account...`; switching between saved accounts scopes Google OAuth fetches and account-scoped `agy` runs.
 
 ## Remote OAuth data sources
 
@@ -395,6 +401,7 @@ and source-linked, not private captures or proof of live installation/UI behavio
 - Local HTTPS uses a self-signed cert; the probe allows insecure TLS only for loopback hosts.
 
 ## Key files
+- `Sources/CodexBarCore/Providers/Antigravity/AntigravityAgyCredentialScope.swift`
 - `Sources/CodexBarCore/Providers/Antigravity/AntigravityCLISession.swift`
 - `Sources/CodexBarCore/Providers/Antigravity/AntigravityProviderDescriptor.swift`
 - `Sources/CodexBarCore/Providers/Antigravity/AntigravityStatusProbe.swift`

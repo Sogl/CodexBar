@@ -200,6 +200,78 @@ struct AntigravityOAuthCredentialsStoreTests {
                 applicationRoots: [root]) == standaloneClient)
     }
 
+    @Test
+    func `agy binary discovery returns cli pair when ide pair is excluded`() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let cliClient = AntigravityOAuthClient(
+            clientID: self.googleClientID("agy-cli"),
+            clientSecret: self.googleClientSecret(repeating: "j"))
+        let ideClient = AntigravityOAuthClient(
+            clientID: self.googleClientID("ide"),
+            clientSecret: self.googleClientSecret(repeating: "k"))
+        // Layout mirrors the real agy binary: secret table first, then the client id
+        // table in reverse order (ide id first, cli id last).
+        var artifactData = Data([0xFF])
+        artifactData.append(Data(
+            """
+            \u{0}\(cliClient.clientSecret)\u{0}\(ideClient.clientSecret)\u{0}oauth_data\
+            \u{0}\(ideClient.clientID)\u{0}\(cliClient.clientID)\u{0}
+            """.utf8))
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let binaryURL = root.appendingPathComponent("agy")
+        try artifactData.write(to: binaryURL)
+
+        #expect(
+            AntigravityOAuthConfig.discoverClientFromAgyBinary(
+                binaryPath: binaryURL.path,
+                ideClient: ideClient) == cliClient)
+    }
+
+    @Test
+    func `agy binary discovery prefers trailing client id without ide hint`() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let cliClient = AntigravityOAuthClient(
+            clientID: self.googleClientID("agy-cli"),
+            clientSecret: self.googleClientSecret(repeating: "j"))
+        let ideClient = AntigravityOAuthClient(
+            clientID: self.googleClientID("ide"),
+            clientSecret: self.googleClientSecret(repeating: "k"))
+        var artifactData = Data([0xFF])
+        artifactData.append(Data(
+            """
+            \u{0}\(cliClient.clientSecret)\u{0}\(ideClient.clientSecret)\u{0}oauth_data\
+            \u{0}\(ideClient.clientID)\u{0}\(cliClient.clientID)\u{0}
+            """.utf8))
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let binaryURL = root.appendingPathComponent("agy")
+        try artifactData.write(to: binaryURL)
+
+        #expect(
+            AntigravityOAuthConfig.discoverClientFromAgyBinary(
+                binaryPath: binaryURL.path) == cliClient)
+    }
+
+    @Test
+    func `agy binary discovery returns nil without client pairs`() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let binaryURL = root.appendingPathComponent("agy")
+        try Data([0xFF, 0x00, 0x42]).write(to: binaryURL)
+
+        #expect(
+            AntigravityOAuthConfig.discoverClientFromAgyBinary(
+                binaryPath: binaryURL.path) == nil)
+    }
+
     private func writeAntigravityApp(
         named name: String,
         under root: URL,

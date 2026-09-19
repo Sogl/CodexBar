@@ -1,0 +1,513 @@
+import Foundation
+import Testing
+@testable import CodexBarCore
+
+// MARK: - Test Fakes
+
+private actor FakeAntigravityAgyCredentialMutationLock: AntigravityAgyCredentialMutationLocking {
+    private var isLocked = false
+    private var waitingTasks: [CheckedContinuation<Void, Never>] = []
+    var activeLocks = 0
+    var maxConcurrentLocks = 0
+
+    func withLock<T: Sendable>(_ operation: @Sendable () async throws -> T) async throws -> T {
+        await self.acquire()
+        self.activeLocks += 1
+        if self.activeLocks > self.maxConcurrentLocks {
+            self.maxConcurrentLocks = self.activeLocks
+        }
+
+        do {
+            let value = try await operation()
+            self.activeLocks -= 1
+            self.release()
+            return value
+        } catch {
+            self.activeLocks -= 1
+            self.release()
+            throw error
+        }
+    }
+
+    func maximumConcurrentLocks() -> Int {
+        self.maxConcurrentLocks
+    }
+
+    private func acquire() async {
+        guard self.isLocked else {
+            self.isLocked = true
+            return
+        }
+        await withCheckedContinuation { continuation in
+            self.waitingTasks.append(continuation)
+        }
+    }
+
+    private func release() {
+        if let continuation = self.waitingTasks.first {
+            self.waitingTasks.removeFirst()
+            continuation.resume()
+        } else {
+            self.isLocked = false
+        }
+    }
+}
+
+private final class AntigravitySessionResetRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var resetCount = 0
+
+    func recordReset() {
+        self.lock.lock()
+        self.resetCount += 1
+        self.lock.unlock()
+    }
+
+    var count: Int {
+        self.lock.lock()
+        defer { self.lock.unlock() }
+        return self.resetCount
+    }
+}
+
+private final class AntigravityScopeCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+
+    @discardableResult
+    func increment() -> Int {
+        self.lock.lock()
+        self.count += 1
+        let value = self.count
+        self.lock.unlock()
+        return value
+    }
+
+    var value: Int {
+        self.lock.lock()
+        defer { self.lock.unlock() }
+        return self.count
+    }
+}
+
+// MARK: - Test Suite
+
+struct AntigravityAgyCredentialScopeTests {
+    private static let sampleExpiry = Date(timeIntervalSince1970: 1_789_562_096)
+
+    private static func validCredentials(email: String = "user@example.com") -> AntigravityOAuthCredentials {
+        AntigravityOAuthCredentials(
+            accessToken: "test-access-token",
+            refreshToken: "test-refresh-token",
+            expiryDate: self.sampleExpiry,
+            idToken: nil,
+            email: email)
+    }
+
+    private static func makeUsage(email: String?) -> UsageSnapshot {
+        UsageSnapshot(
+            primary: RateWindow(usedPercent: 20, windowMinutes: 300, resetsAt: nil, resetDescription: nil),
+            secondary: RateWindow(usedPercent: 10, windowMinutes: 10080, resetsAt: nil, resetDescription: nil),
+            tertiary: nil,
+            updatedAt: Date(),
+            identity: ProviderIdentitySnapshot(
+                providerID: .antigravity,
+                accountEmail: email,
+                accountOrganization: nil,
+                loginMethod: "Pro"))
+    }
+
+    private static func makeWarmDependencies(
+        processInfos: @escaping @Sendable (TimeInterval) async throws
+            -> [AntigravityStatusProbe.ProcessInfoResult] = { _ in [] },
+        listeningPorts: @escaping @Sendable (Int, TimeInterval) async throws -> [Int] = { _, _ in [] },
+        fetchSnapshot: @escaping @Sendable ([Int], TimeInterval) async throws -> AntigravityStatusSnapshot = { _, _ in
+            throw AntigravityStatusProbeError.notRunning
+        }) -> AntigravityCLIHTTPSFetchStrategy.WarmAgyDependencies
+    {
+        AntigravityCLIHTTPSFetchStrategy.WarmAgyDependencies(
+            processInfos: processInfos,
+            listeningPorts: listeningPorts,
+            fetchSnapshot: fetchSnapshot,
+            processOwnerUserID: { _ in 501 },
+            currentUserID: { 501 },
+            ownedPID: { nil },
+            now: Date.init)
+    }
+
+    private static func makeAccountsDirectory() throws -> URL {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("agy-scope-tests-" + UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        return url
+    }
+
+    /// OAuth credentials encode into the `fileTokenStorage` payload `agy` reads.
+    @Test
+    func `oauth credentials encode to agy file token payload`() throws {
+        let credentials = AntigravityOAuthCredentials(
+            accessToken: "test-access-token",
+            refreshToken: "test-refresh-token",
+            expiryDate: Self.sampleExpiry,
+            idToken: "test-id-token",
+            email: "user@example.com")
+
+        let data = try #require(AntigravityAgyFileTokenEncoder.encode(credentials: credentials))
+        let payload = try #require(AntigravityAgyFileTokenEncoder.decode(data: data))
+
+        #expect(payload.authMethod == "consumer")
+        #expect(payload.idToken == "test-id-token")
+        #expect(payload.token.accessToken == "test-access-token")
+        #expect(payload.token.tokenType == "Bearer")
+        #expect(payload.token.refreshToken == "test-refresh-token")
+        #expect(payload.token.expiry == "2026-09-16T12:34:56Z")
+        #expect(AntigravityAgyFileTokenEncoder.expiryDate(from: payload) == Self.sampleExpiry)
+    }
+
+    /// Credentials without an access token, refresh token, or expiry cannot build a payload.
+    @Test
+    func `encoder rejects credentials missing required fields`() {
+        #expect(AntigravityAgyFileTokenEncoder.encode(credentials: AntigravityOAuthCredentials(
+            accessToken: nil,
+            refreshToken: "refresh",
+            expiryDate: Self.sampleExpiry)) == nil)
+        #expect(AntigravityAgyFileTokenEncoder.encode(credentials: AntigravityOAuthCredentials(
+            accessToken: "access",
+            refreshToken: nil,
+            expiryDate: Self.sampleExpiry)) == nil)
+        #expect(AntigravityAgyFileTokenEncoder.encode(credentials: AntigravityOAuthCredentials(
+            accessToken: "access",
+            refreshToken: "refresh",
+            expiryDate: nil)) == nil)
+    }
+
+    /// `agy` may persist RFC3339 expiries with nanosecond precision; both forms must parse.
+    @Test
+    func `expiry parser handles plain fractional and nanosecond rfc3339`() {
+        func payload(expiry: String) -> AntigravityAgyFileTokenPayload {
+            AntigravityAgyFileTokenPayload(
+                token: .init(
+                    accessToken: "a",
+                    tokenType: "Bearer",
+                    refreshToken: "r",
+                    expiry: expiry),
+                authMethod: "consumer",
+                idToken: nil)
+        }
+
+        let plain = AntigravityAgyFileTokenEncoder.expiryDate(from: payload(expiry: "2026-09-16T12:34:56Z"))
+        let fractional = AntigravityAgyFileTokenEncoder.expiryDate(
+            from: payload(expiry: "2026-09-16T12:34:56.789Z"))
+        let nanos = AntigravityAgyFileTokenEncoder.expiryDate(
+            from: payload(expiry: "2026-09-16T12:34:56.123456789Z"))
+
+        #expect(plain == Self.sampleExpiry)
+        #expect(fractional != nil)
+        #expect(abs((nanos?.timeIntervalSince1970 ?? 0) - 1_789_562_096.123456) < 1)
+    }
+
+    /// `prepare` writes the token into an isolated staging HOME and returns the
+    /// environment (`HOME`, `PWD`, `SSH_TTY`) that makes `agy` pick file token storage.
+    @Test
+    func `prepare stages token file and scoped environment`() async throws {
+        let accountsDirectory = try Self.makeAccountsDirectory()
+        defer { try? FileManager.default.removeItem(at: accountsDirectory) }
+        let coordinator = AntigravityAgyHomeCoordinator(
+            mutationLock: FakeAntigravityAgyCredentialMutationLock(),
+            resetSession: {},
+            accountsDirectory: accountsDirectory)
+
+        let scope = try await coordinator.prepare(
+            credentials: Self.validCredentials(),
+            accountKey: "Account ID/with*unsafe?chars")
+
+        let homeURL = try #require(scope.homeURL)
+        #expect(homeURL.path.hasPrefix(accountsDirectory.path))
+        #expect(!homeURL.lastPathComponent.contains("/"))
+        #expect(scope.environment["HOME"] == homeURL.path)
+        #expect(scope.environment["PWD"] == homeURL.path)
+        #expect(scope.environment["SSH_TTY"]?.isEmpty == false)
+
+        let tokenURL = AntigravityAgyHomeCoordinator.tokenURL(home: homeURL)
+        #expect(tokenURL.path.hasPrefix(homeURL.path))
+        #expect(tokenURL.path.contains(".gemini/antigravity-cli"))
+
+        let data = try #require(FileManager.default.contents(atPath: tokenURL.path))
+        let payload = try #require(AntigravityAgyFileTokenEncoder.decode(data: data))
+        #expect(payload.token.accessToken == "test-access-token")
+
+        let attributes = try FileManager.default.attributesOfItem(atPath: tokenURL.path)
+        #expect((attributes[.posixPermissions] as? Int) == 0o600)
+    }
+
+    /// A fresher token already staged by `agy`'s own refresh is not overwritten by an
+    /// older injected credential; an older staged token is replaced.
+    @Test
+    func `prepare keeps fresher staged token and replaces staler one`() async throws {
+        let accountsDirectory = try Self.makeAccountsDirectory()
+        defer { try? FileManager.default.removeItem(at: accountsDirectory) }
+        let coordinator = AntigravityAgyHomeCoordinator(
+            mutationLock: FakeAntigravityAgyCredentialMutationLock(),
+            resetSession: {},
+            accountsDirectory: accountsDirectory)
+        let accountKey = "account-a"
+
+        let scope = try await coordinator.prepare(
+            credentials: Self.validCredentials(),
+            accountKey: accountKey)
+        let tokenURL = try AntigravityAgyHomeCoordinator.tokenURL(home: #require(scope.homeURL))
+
+        // agy persisted a fresher token for the same grant: a stale injected credential
+        // must not clobber it.
+        let fresher = AntigravityOAuthCredentials(
+            accessToken: "agy-refreshed-access",
+            refreshToken: "test-refresh-token",
+            expiryDate: Self.sampleExpiry.addingTimeInterval(3600))
+        try #require(AntigravityAgyFileTokenEncoder.encode(credentials: fresher)).write(to: tokenURL)
+
+        _ = try await coordinator.prepare(credentials: Self.validCredentials(), accountKey: accountKey)
+        let kept = try AntigravityAgyFileTokenEncoder.decode(
+            data: #require(FileManager.default.contents(atPath: tokenURL.path)))
+        #expect(kept?.token.accessToken == "agy-refreshed-access")
+
+        // A newer injected credential replaces the staged token again.
+        let evenNewer = AntigravityOAuthCredentials(
+            accessToken: "injected-newer-access",
+            refreshToken: "test-refresh-token",
+            expiryDate: Self.sampleExpiry.addingTimeInterval(7200))
+        _ = try await coordinator.prepare(credentials: evenNewer, accountKey: accountKey)
+        let replaced = try AntigravityAgyFileTokenEncoder.decode(
+            data: #require(FileManager.default.contents(atPath: tokenURL.path)))
+        #expect(replaced?.token.accessToken == "injected-newer-access")
+    }
+
+    /// A staged token from a different grant (another refresh token, e.g. credentials
+    /// re-issued by a different OAuth client) is always replaced even when it is fresher.
+    @Test
+    func `prepare replaces staged token from a different grant`() async throws {
+        let accountsDirectory = try Self.makeAccountsDirectory()
+        defer { try? FileManager.default.removeItem(at: accountsDirectory) }
+        let coordinator = AntigravityAgyHomeCoordinator(
+            mutationLock: FakeAntigravityAgyCredentialMutationLock(),
+            resetSession: {},
+            accountsDirectory: accountsDirectory)
+        let accountKey = "account-a"
+
+        let scope = try await coordinator.prepare(
+            credentials: Self.validCredentials(),
+            accountKey: accountKey)
+        let tokenURL = try AntigravityAgyHomeCoordinator.tokenURL(home: #require(scope.homeURL))
+
+        let foreignGrant = AntigravityOAuthCredentials(
+            accessToken: "foreign-access",
+            refreshToken: "foreign-refresh-token",
+            expiryDate: Self.sampleExpiry.addingTimeInterval(3600))
+        try #require(AntigravityAgyFileTokenEncoder.encode(credentials: foreignGrant)).write(to: tokenURL)
+
+        _ = try await coordinator.prepare(credentials: Self.validCredentials(), accountKey: accountKey)
+        let replaced = try AntigravityAgyFileTokenEncoder.decode(
+            data: #require(FileManager.default.contents(atPath: tokenURL.path)))
+        #expect(replaced?.token.refreshToken == "test-refresh-token")
+    }
+
+    /// `withPreparedScope` serializes work under the mutation lock and resets the managed
+    /// `agy` session before and after the operation, including on failure.
+    @Test
+    func `withPreparedScope resets managed session around operation`() async throws {
+        let accountsDirectory = try Self.makeAccountsDirectory()
+        defer { try? FileManager.default.removeItem(at: accountsDirectory) }
+        let resetRecorder = AntigravitySessionResetRecorder()
+        let coordinator = AntigravityAgyHomeCoordinator(
+            mutationLock: FakeAntigravityAgyCredentialMutationLock(),
+            resetSession: { resetRecorder.recordReset() },
+            accountsDirectory: accountsDirectory)
+
+        let result = try await coordinator.withPreparedScope(
+            credentials: Self.validCredentials(),
+            accountKey: "account-a")
+        { scope in
+            #expect(scope.environment["HOME"] == scope.homeURL?.path)
+            return "done"
+        }
+
+        #expect(result == "done")
+        #expect(resetRecorder.count == 2)
+
+        await #expect(throws: AntigravityAgyHomeScopeError.self) {
+            try await coordinator.withPreparedScope(
+                credentials: AntigravityOAuthCredentials(
+                    accessToken: nil,
+                    refreshToken: "refresh",
+                    expiryDate: Self.sampleExpiry),
+                accountKey: "account-b")
+            { _ in "never" }
+        }
+        // Failing before the operation still leaves the session reset on entry.
+        #expect(resetRecorder.count == 3)
+    }
+
+    /// Concurrent scoped fetches serialize through the lock instead of mixing staging dirs.
+    @Test
+    func `concurrent account scoped fetches are serialized`() async throws {
+        let accountsDirectory = try Self.makeAccountsDirectory()
+        defer { try? FileManager.default.removeItem(at: accountsDirectory) }
+        let lock = FakeAntigravityAgyCredentialMutationLock()
+        let coordinator = AntigravityAgyHomeCoordinator(
+            mutationLock: lock,
+            resetSession: {},
+            accountsDirectory: accountsDirectory)
+
+        let credsA = Self.validCredentials(email: "a@example.com")
+        let credsB = Self.validCredentials(email: "b@example.com")
+
+        async let fetchA = coordinator.withPreparedScope(credentials: credsA, accountKey: "a") { scope in
+            try await Task.sleep(nanoseconds: 50_000_000)
+            return scope.environment["HOME"] ?? ""
+        }
+        async let fetchB = coordinator.withPreparedScope(credentials: credsB, accountKey: "b") { scope in
+            try await Task.sleep(nanoseconds: 50_000_000)
+            return scope.environment["HOME"] ?? ""
+        }
+
+        let (homeA, homeB) = try await (fetchA, fetchB)
+        #expect(homeA != homeB)
+        #expect(homeA.contains("/a/"))
+        #expect(homeB.contains("/b/"))
+        let maximumConcurrentLocks = await lock.maximumConcurrentLocks()
+        #expect(maximumConcurrentLocks == 1)
+    }
+
+    /// A warm ambient `agy` that already matches the selected account is reused; neither the
+    /// scoped fetch nor a fresh spawn runs.
+    @Test
+    func `matching external warm agy skips account scoped fetch and spawn`() async throws {
+        let strategy = AntigravityCLIHTTPSFetchStrategy()
+        let spawnCallCount = AntigravityScopeCounter()
+        let scopedCallCount = AntigravityScopeCounter()
+
+        let warmSnapshot = AntigravityStatusSnapshot(
+            modelQuotas: [AntigravityModelQuota(
+                label: "Gemini",
+                modelId: "gemini-pro",
+                remainingFraction: 0.9,
+                resetTime: nil,
+                resetDescription: nil)],
+            accountEmail: "user@example.com",
+            accountPlan: "Pro",
+            source: .local)
+
+        let result = try await strategy.fetchUsingWarmSession(
+            binary: "/usr/local/bin/agy",
+            idleWindow: 60,
+            resetAfterFetch: false,
+            expectedAccountEmail: "user@example.com",
+            accountScopedFetch: {
+                scopedCallCount.increment()
+                return strategy.makeResult(
+                    usage: Self.makeUsage(email: "user@example.com"),
+                    sourceLabel: "cli")
+            },
+            warmDependencies: Self.makeWarmDependencies(
+                processInfos: { _ in
+                    [AntigravityStatusProbe.ProcessInfoResult(
+                        pid: 7777,
+                        extensionPort: nil,
+                        extensionServerCSRFToken: nil,
+                        csrfToken: "",
+                        commandLine: "/usr/local/bin/agy")]
+                },
+                listeningPorts: { _, _ in [55000] },
+                fetchSnapshot: { _, _ in warmSnapshot }),
+            spawnFetch: { _, _, _ in
+                spawnCallCount.increment()
+                return strategy.makeResult(
+                    usage: Self.makeUsage(email: "user@example.com"),
+                    sourceLabel: "cli")
+            })
+
+        #expect(result.usage.identity?.accountEmail == "user@example.com")
+        #expect(scopedCallCount.value == 0)
+        #expect(spawnCallCount.value == 0)
+    }
+
+    /// When the ambient `agy` reports another account, the scoped fetch runs instead of the
+    /// ambient spawn path.
+    @Test
+    func `warm mismatch falls through to account scoped fetch`() async throws {
+        let strategy = AntigravityCLIHTTPSFetchStrategy()
+        let spawnCallCount = AntigravityScopeCounter()
+        let scopedCallCount = AntigravityScopeCounter()
+
+        let otherAccountWarmSnapshot = AntigravityStatusSnapshot(
+            modelQuotas: [AntigravityModelQuota(
+                label: "Gemini",
+                modelId: "gemini-pro",
+                remainingFraction: 0.9,
+                resetTime: nil,
+                resetDescription: nil)],
+            accountEmail: "other@example.com",
+            accountPlan: "Free",
+            source: .local)
+
+        let result = try await strategy.fetchUsingWarmSession(
+            binary: "/usr/local/bin/agy",
+            idleWindow: 60,
+            resetAfterFetch: false,
+            expectedAccountEmail: "selected@example.com",
+            accountScopedFetch: {
+                scopedCallCount.increment()
+                return strategy.makeResult(
+                    usage: Self.makeUsage(email: "selected@example.com"),
+                    sourceLabel: "cli")
+            },
+            warmDependencies: Self.makeWarmDependencies(
+                processInfos: { _ in
+                    [AntigravityStatusProbe.ProcessInfoResult(
+                        pid: 8888,
+                        extensionPort: nil,
+                        extensionServerCSRFToken: nil,
+                        csrfToken: "",
+                        commandLine: "/usr/local/bin/agy")]
+                },
+                listeningPorts: { _, _ in [55000] },
+                fetchSnapshot: { _, _ in otherAccountWarmSnapshot }),
+            spawnFetch: { _, _, _ in
+                spawnCallCount.increment()
+                return strategy.makeResult(
+                    usage: Self.makeUsage(email: "other@example.com"),
+                    sourceLabel: "cli")
+            })
+
+        #expect(result.usage.identity?.accountEmail == "selected@example.com")
+        #expect(scopedCallCount.value == 1)
+        #expect(spawnCallCount.value == 0)
+    }
+
+    /// Without a selected account the ambient spawn path is unchanged.
+    @Test
+    func `no selected account keeps ambient spawn path`() async throws {
+        let strategy = AntigravityCLIHTTPSFetchStrategy()
+        let spawnCallCount = AntigravityScopeCounter()
+        let scopedCallCount = AntigravityScopeCounter()
+
+        let result = try await strategy.fetchUsingWarmSession(
+            binary: "/usr/local/bin/agy",
+            idleWindow: 60,
+            resetAfterFetch: false,
+            expectedAccountEmail: nil,
+            accountScopedFetch: nil,
+            warmDependencies: Self.makeWarmDependencies(),
+            spawnFetch: { _, idleWindow, resetAfterFetch in
+                spawnCallCount.increment()
+                #expect(idleWindow == 60)
+                #expect(!resetAfterFetch)
+                return strategy.makeResult(
+                    usage: Self.makeUsage(email: "ambient@example.com"),
+                    sourceLabel: "cli")
+            })
+
+        #expect(result.usage.identity?.accountEmail == "ambient@example.com")
+        #expect(scopedCallCount.value == 0)
+        #expect(spawnCallCount.value == 1)
+    }
+}

@@ -6,6 +6,7 @@ import FoundationNetworking
 public enum AntigravityRemoteFetchError: LocalizedError, Sendable, Equatable {
     case notLoggedIn
     case permissionDenied(String)
+    case accountNotEligible
     case apiError(String)
     case parseFailed(String)
 
@@ -15,6 +16,10 @@ public enum AntigravityRemoteFetchError: LocalizedError, Sendable, Equatable {
             "Antigravity Google auth not found. Use Antigravity login to authenticate."
         case let .permissionDenied(message):
             "Antigravity remote API permission denied: \(message)"
+        case .accountNotEligible:
+            "Antigravity rejected these credentials: the account has not accepted the Gemini Code "
+                + "Assist terms for the OAuth client that issued them. Remove and re-add the account, "
+                + "or sign in with the agy CLI once to onboard it."
         case let .apiError(message):
             "Antigravity remote API error: \(message)"
         case let .parseFailed(message):
@@ -78,6 +83,11 @@ public struct AntigravityRemoteUsageFetcher: Sendable {
 
     public func fetch() async throws -> AntigravityStatusSnapshot {
         let source = try Self.resolveCredentialSource(homeDirectory: self.homeDirectory, environment: self.environment)
+        Self.log.debug("Antigravity remote credentials resolved", metadata: [
+            "source": source.store == nil ? "injected" : "store",
+            "hasCredentials": source.credentials == nil ? "no" : "yes",
+            "account": AntigravityFetchLog.accountFingerprint(source.credentials?.resolvedAccountEmail),
+        ])
         guard let credentials = source.credentials else {
             throw AntigravityRemoteFetchError.notLoggedIn
         }
@@ -104,6 +114,7 @@ public struct AntigravityRemoteUsageFetcher: Sendable {
             oauthClientResolver: self.oauthClientResolver,
             credentialsUpdateHandler: self.credentialsUpdateHandler)
         if Self.shouldRefresh(expiryDate: credentials.expiryDate, now: Date()) {
+            Self.log.debug("Antigravity remote: access token refresh needed")
             guard let refreshToken = credentials.refreshToken?.trimmedNonEmpty else {
                 throw AntigravityRemoteFetchError.notLoggedIn
             }
@@ -129,6 +140,11 @@ public struct AntigravityRemoteUsageFetcher: Sendable {
             storedProjectID: credentials.projectID?.trimmedNonEmpty,
             initialResponse: codeAssist,
             context: context)
+        Self.log.debug("Antigravity remote loadCodeAssist resolved", metadata: [
+            "projectID": projectId == nil ? "none" : "resolved",
+            "currentTier": codeAssist.currentTier?.id ?? "none",
+            "planType": codeAssist.planInfo?.planType ?? "none",
+        ])
         if let projectId, credentials.projectID?.trimmedNonEmpty != projectId {
             credentials.projectID = projectId
             do {
@@ -142,6 +158,12 @@ public struct AntigravityRemoteUsageFetcher: Sendable {
             projectId: projectId,
             timeout: self.timeout,
             dataLoader: self.dataLoader)
+        Self.log.info("Antigravity remote quota resolved", metadata: [
+            "account": AntigravityFetchLog.accountFingerprint(claims.email),
+            "plan": Self.resolvePlan(response: codeAssist, claims: claims) ?? "none",
+            "models": "\(models.count)",
+            "knownFractions": "\(models.count { $0.remainingFraction != nil })",
+        ])
 
         return AntigravityStatusSnapshot(
             modelQuotas: models,
@@ -210,6 +232,10 @@ public struct AntigravityRemoteUsageFetcher: Sendable {
                 timeout: timeout,
                 dataLoader: dataLoader)
             let modelQuotas = try Self.parseModelQuotas(response)
+            Self.log.debug("Antigravity remote fetchAvailableModels parsed", metadata: [
+                "models": "\(response.models?.count ?? 0)",
+                "withQuotaInfo": "\(modelQuotas.count)",
+            ])
             if Self.shouldVerifyFullRemoteQuotas(modelQuotas) {
                 let quotaBuckets = try await Self.fetchQuotaBucketsIfPermitted(
                     accessToken: accessToken,
@@ -217,6 +243,7 @@ public struct AntigravityRemoteUsageFetcher: Sendable {
                     timeout: timeout,
                     dataLoader: dataLoader)
                 guard let quotaBuckets, Self.hasQuotaFractionData(quotaBuckets) else {
+                    Self.log.info("Antigravity remote quota verification returned no usable fractions")
                     return []
                 }
                 return Self.mergeVerifiedQuotas(modelQuotas: modelQuotas, verifiedQuotas: quotaBuckets)
@@ -227,11 +254,15 @@ public struct AntigravityRemoteUsageFetcher: Sendable {
                 throw error
             }
             Self.log.info("Falling back to retrieveUserQuota for Antigravity remote usage")
-            return try await Self.fetchQuotaBucketsIfPermitted(
+            let buckets = try await Self.fetchQuotaBucketsIfPermitted(
                 accessToken: accessToken,
                 projectId: projectId,
                 timeout: timeout,
                 dataLoader: dataLoader) ?? []
+            Self.log.debug("Antigravity remote retrieveUserQuota fallback resolved", metadata: [
+                "buckets": "\(buckets.count)",
+            ])
+            return buckets
         }
     }
 
@@ -410,6 +441,9 @@ public struct AntigravityRemoteUsageFetcher: Sendable {
             throw AntigravityRemoteFetchError.notLoggedIn
         case 403:
             let message = String(data: httpResponse.data, encoding: .utf8)?.trimmedNonEmpty ?? "HTTP 403"
+            if AntigravityStatusProbeError.isEligibilityFailure(message) {
+                throw AntigravityRemoteFetchError.accountNotEligible
+            }
             throw AntigravityRemoteFetchError.permissionDenied(message)
         default:
             let message = String(data: httpResponse.data, encoding: .utf8)?.trimmedNonEmpty

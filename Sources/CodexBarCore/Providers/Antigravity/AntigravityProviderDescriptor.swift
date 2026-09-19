@@ -196,22 +196,31 @@ public enum AntigravityProviderDescriptor {
         let ide = AntigravityStatusFetchStrategy(source: .ide)
         let oauth = AntigravityOAuthFetchStrategy()
         let offline = AntigravityOfflineFetchStrategy()
-        switch context.sourceMode {
+        let strategies: [any ProviderFetchStrategy] = switch context.sourceMode {
         case .cli:
-            return [app, cli, ide, offline]
+            [app, cli, ide, offline]
         case .oauth:
-            return [oauth]
+            [oauth]
         case .auto:
             if context.selectedTokenAccountID != nil ||
                 context.env[AntigravityOAuthCredentialsStore.environmentCredentialsKey] != nil ||
                 self.hasSharedOAuthCredentials(context: context)
             {
-                return [app, cli, ide, oauth, offline]
+                [app, cli, ide, oauth, offline]
+            } else {
+                [app, cli, ide, offline]
             }
-            return [app, cli, ide, offline]
         case .web, .api:
-            return []
+            []
         }
+        AntigravityFetchLog.log.info("Antigravity strategies resolved", metadata: [
+            "sourceMode": "\(context.sourceMode)",
+            "selectedAccount": context.selectedTokenAccountID == nil ? "no" : "yes",
+            "injectedCredentials": context.env[AntigravityOAuthCredentialsStore.environmentCredentialsKey] == nil
+                ? "no" : "yes",
+            "strategies": strategies.map(\.id).joined(separator: ","),
+        ])
+        return strategies
     }
 
     private static func hasSharedOAuthCredentials(context: ProviderFetchContext) -> Bool {
@@ -281,12 +290,26 @@ struct AntigravityStatusFetchStrategy: ProviderFetchStrategy {
         } else {
             nil
         }
-        let snap = try await probe.fetch(matchingAccountEmail: selectedAccountEmail)
-        let usage = try snap.toUsageSnapshot()
-        try AntigravitySelectedAccountGuard.validate(usage, context: context)
-        return self.makeResult(
-            usage: usage,
-            sourceLabel: self.source.sourceLabel)
+        do {
+            let snap = try await probe.fetch(matchingAccountEmail: selectedAccountEmail)
+            let usage = try snap.toUsageSnapshot()
+            try AntigravitySelectedAccountGuard.validate(usage, context: context)
+            AntigravityFetchLog.log.info("Antigravity local probe succeeded", metadata: [
+                "strategy": self.id,
+                "account": AntigravityFetchLog.accountFingerprint(usage.identity?.accountEmail),
+                "quota": AntigravityFetchLog.statusSummary(snap),
+            ])
+            return self.makeResult(
+                usage: usage,
+                sourceLabel: self.source.sourceLabel)
+        } catch {
+            AntigravityFetchLog.log.debug("Antigravity local probe failed", metadata: [
+                "strategy": self.id,
+                "expectedAccount": AntigravityFetchLog.accountFingerprint(selectedAccountEmail),
+                "error": error.localizedDescription,
+            ])
+            throw error
+        }
     }
 
     func shouldFallback(on _: Error, context: ProviderFetchContext) -> Bool {
@@ -300,6 +323,11 @@ struct AntigravityCLIHTTPSFetchStrategy: ProviderFetchStrategy {
     let id: String = "antigravity.cli-https"
     let kind: ProviderFetchKind = .cli
     private static let log = CodexBarLog.logger(LogCategories.provider(.antigravity))
+    private let homeCoordinator: AntigravityAgyHomeCoordinator
+
+    init(homeCoordinator: AntigravityAgyHomeCoordinator = .shared) {
+        self.homeCoordinator = homeCoordinator
+    }
 
     struct SnapshotWaitDependencies {
         let pollIntervalNanoseconds: UInt64
@@ -347,6 +375,9 @@ struct AntigravityCLIHTTPSFetchStrategy: ProviderFetchStrategy {
         } catch let error as CancellationError {
             throw error
         } catch {
+            Self.log.debug(
+                "Antigravity warm agy scan: process discovery failed",
+                metadata: ["error": error.localizedDescription])
             return nil
         }
         try Task.checkCancellation()
@@ -362,12 +393,21 @@ struct AntigravityCLIHTTPSFetchStrategy: ProviderFetchStrategy {
                 dependencies.processOwnerUserID(info.pid) == currentUserID &&
                 AntigravityStatusProbe.antigravityProcessKind(info.commandLine) == .cli
         }
-        guard !cliProcesses.isEmpty else { return nil }
+        guard !cliProcesses.isEmpty else {
+            Self.log.debug("Antigravity warm agy scan: no reusable CLI processes", metadata: [
+                "seen": "\(processInfos.count)",
+                "ownedPID": ownedPID.map(String.init) ?? "none",
+            ])
+            return nil
+        }
 
         for info in cliProcesses {
             if let expectedBinaryPath {
                 guard Self.process(info, matchesBinaryPath: expectedBinaryPath)
                 else {
+                    Self.log.debug("Antigravity warm agy candidate skipped: binary mismatch", metadata: [
+                        "pid": "\(info.pid)",
+                    ])
                     continue
                 }
             }
@@ -380,10 +420,19 @@ struct AntigravityCLIHTTPSFetchStrategy: ProviderFetchStrategy {
             } catch let error as CancellationError {
                 throw error
             } catch {
+                Self.log.debug("Antigravity warm agy candidate skipped: no ports", metadata: [
+                    "pid": "\(info.pid)",
+                    "error": error.localizedDescription,
+                ])
                 continue
             }
             try Task.checkCancellation()
-            guard !ports.isEmpty else { continue }
+            guard !ports.isEmpty else {
+                Self.log.debug("Antigravity warm agy candidate skipped: zero listening ports", metadata: [
+                    "pid": "\(info.pid)",
+                ])
+                continue
+            }
             guard let fetchTimeout = Self.remainingWarmProbeTime(deadline: deadline, now: dependencies.now) else {
                 return nil
             }
@@ -393,19 +442,37 @@ struct AntigravityCLIHTTPSFetchStrategy: ProviderFetchStrategy {
             } catch let error as CancellationError {
                 throw error
             } catch {
+                Self.log.debug("Antigravity warm agy candidate skipped: status fetch failed", metadata: [
+                    "pid": "\(info.pid)",
+                    "ports": ports.map(String.init).joined(separator: ","),
+                    "error": error.localizedDescription,
+                ])
                 continue
             }
             try Task.checkCancellation()
-            guard (try? snapshot.toUsageSnapshot()) != nil,
-                  AntigravitySelectedAccountGuard.matches(
-                      snapshotAccountEmail: snapshot.accountEmail,
-                      expectedAccountEmail: expectedAccountEmail)
-            else {
+            guard let usage = try? snapshot.toUsageSnapshot() else {
+                Self.log.debug("Antigravity warm agy candidate skipped: snapshot not usable", metadata: [
+                    "pid": "\(info.pid)",
+                    "quota": AntigravityFetchLog.statusSummary(snapshot),
+                ])
                 continue
             }
-            Self.log.debug("Antigravity CLI HTTPS reusing warm agy", metadata: [
+            guard AntigravitySelectedAccountGuard.matches(
+                snapshotAccountEmail: snapshot.accountEmail,
+                expectedAccountEmail: expectedAccountEmail)
+            else {
+                Self.log.debug("Antigravity warm agy candidate skipped: account mismatch", metadata: [
+                    "pid": "\(info.pid)",
+                    "expectedAccount": AntigravityFetchLog.accountFingerprint(expectedAccountEmail),
+                    "foundAccount": AntigravityFetchLog.accountFingerprint(
+                        snapshot.accountEmail ?? usage.identity?.accountEmail),
+                ])
+                continue
+            }
+            Self.log.info("Antigravity CLI HTTPS reusing warm agy", metadata: [
                 "pid": "\(info.pid)",
                 "ports": ports.map(String.init).joined(separator: ","),
+                "quota": AntigravityFetchLog.statusSummary(snapshot),
             ])
             return snapshot
         }
@@ -493,12 +560,40 @@ struct AntigravityCLIHTTPSFetchStrategy: ProviderFetchStrategy {
         async throws -> ProviderFetchResult
     {
         guard let binary = BinaryLocator.resolveAntigravityBinary(env: context.env) else {
+            Self.log.debug("Antigravity CLI HTTPS fetch: agy binary not found")
             throw AntigravityStatusProbeError.notRunning
         }
         let expectedAccountEmail: String? = if context.sourceMode == .auto,
                                                context.selectedTokenAccountID != nil
         {
             AntigravitySelectedAccountGuard.selectedAccountEmail(context: context)
+        } else {
+            nil
+        }
+        let selectedAccountCredentials: AntigravityOAuthCredentials? = if context.sourceMode == .auto,
+                                                                          context.selectedTokenAccountID != nil
+        {
+            AntigravitySelectedAccountGuard.selectedAccountCredentials(context: context)
+        } else {
+            nil
+        }
+        Self.log.info("Antigravity CLI HTTPS fetch start", metadata: [
+            "binary": binary,
+            "sourceMode": "\(context.sourceMode)",
+            "expectedAccount": AntigravityFetchLog.accountFingerprint(expectedAccountEmail),
+            "scopedCredentials": selectedAccountCredentials == nil ? "no" : "yes",
+        ])
+        let accountScopedFetch: (@Sendable () async throws -> ProviderFetchResult)? = if let
+            selectedAccountCredentials
+        {
+            {
+                try await self.fetchAccountScopedReport(
+                    credentials: selectedAccountCredentials,
+                    accountKey: context.selectedTokenAccountID?.uuidString ?? "account",
+                    binary: binary,
+                    environment: context.env,
+                    expectedAccountEmail: expectedAccountEmail)
+            }
         } else {
             nil
         }
@@ -510,6 +605,7 @@ struct AntigravityCLIHTTPSFetchStrategy: ProviderFetchStrategy {
                     idleWindow: context.persistentCLISessionIdleWindow,
                     resetAfterFetch: Self.shouldResetSessionAfterFetch(context),
                     expectedAccountEmail: expectedAccountEmail,
+                    accountScopedFetch: accountScopedFetch,
                     warmDependencies: warmDependencies,
                     spawnFetch: { binary, idleWindow, resetAfterFetch in
                         let version = try await Self.agyVersion(binary: binary, environment: context.env)
@@ -536,7 +632,15 @@ struct AntigravityCLIHTTPSFetchStrategy: ProviderFetchStrategy {
             // Identity-free reports must not replace a selected or injected OAuth account's fallback.
             guard context.sourceMode != .auto || (context.selectedTokenAccountID == nil &&
                 context.env[AntigravityOAuthCredentialsStore.environmentCredentialsKey] == nil)
-            else { throw error }
+            else {
+                self.log.debug(
+                    "Antigravity ambient print report suppressed: account-scoped data required",
+                    metadata: ["legacyError": error.localizedDescription])
+                throw error
+            }
+            self.log.debug(
+                "Antigravity legacy CLI fetch failed; trying ambient print report",
+                metadata: ["error": error.localizedDescription])
         }
         return try await reportFetch()
     }
@@ -566,18 +670,48 @@ struct AntigravityCLIHTTPSFetchStrategy: ProviderFetchStrategy {
         let result: SubprocessResult
         do {
             let version = try await Self.parseVersion(run(["--version"], timeout: min(timeout, 3)).stdout)
+            Self.log.debug("agy version probe", metadata: [
+                "version": version.map { "\($0.0).\($0.1).\($0.2)" } ?? "unparsed",
+                "scope": environment["SSH_TTY"] == nil ? "ambient" : "account-scoped",
+            ])
             // Earlier print implementations could turn unsupported slash commands into model prompts.
             guard let version, version >= (1, 1, 11)
             else { throw AntigravityStatusProbeError.parseFailed("CLI usage reports require agy 1.1.11 or later") }
             result = try await run(
                 ["-p", "/usage", "--output-format", "json", "--print-timeout", "90s"], timeout: timeout)
         } catch let error as SubprocessRunnerError {
+            Self.log.warning("agy usage report subprocess failed", metadata: [
+                "detail": AntigravityFetchLog.truncate(error.localizedDescription, limit: 600),
+            ])
             try Task.checkCancellation()
             if case .timedOut = error { throw AntigravityStatusProbeError.timedOut }
-            // Subprocess errors may contain raw stderr; never surface it as a provider diagnostic.
+            // Subprocess errors may contain raw stderr; never surface it as a provider
+            // diagnostic. Known signatures are classified into typed errors instead.
+            if case let .nonZeroExit(_, stderr) = error {
+                throw AntigravityStatusProbeError.usageReportFailure(stderr: stderr)
+            }
             throw AntigravityStatusProbeError.parseFailed("CLI usage report failed")
         }
-        let snapshot = try AntigravityStatusProbe.parseCLIUsageReport(Data(result.stdout.utf8))
+        let snapshot: AntigravityStatusSnapshot
+        do {
+            snapshot = try AntigravityStatusProbe.parseCLIUsageReport(Data(result.stdout.utf8))
+        } catch {
+            Self.log.warning("agy usage report parse failed", metadata: [
+                "error": error.localizedDescription,
+                "stdout": AntigravityFetchLog.truncate(result.stdout),
+                "stderr": AntigravityFetchLog.truncate(result.stderr),
+            ])
+            throw error
+        }
+        if !result.stderr.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            Self.log.debug("agy usage report stderr", metadata: [
+                "stderr": AntigravityFetchLog.truncate(result.stderr),
+            ])
+        }
+        Self.log.info("agy usage report parsed", metadata: [
+            "quota": AntigravityFetchLog.statusSummary(snapshot),
+            "stdoutBytes": "\(result.stdout.utf8.count)",
+        ])
         return try self.makeResult(usage: snapshot.toUsageSnapshot(), sourceLabel: Self.sourceLabel)
     }
 
@@ -649,6 +783,7 @@ struct AntigravityCLIHTTPSFetchStrategy: ProviderFetchStrategy {
         idleWindow: TimeInterval?,
         resetAfterFetch: Bool,
         expectedAccountEmail: String? = nil,
+        accountScopedFetch: (@Sendable () async throws -> ProviderFetchResult)? = nil,
         warmDependencies: WarmAgyDependencies,
         spawnFetch: @Sendable (String, TimeInterval?, Bool) async throws -> ProviderFetchResult)
         async throws -> ProviderFetchResult
@@ -670,7 +805,75 @@ struct AntigravityCLIHTTPSFetchStrategy: ProviderFetchStrategy {
         }
 
         try Task.checkCancellation()
+
+        if let accountScopedFetch {
+            Self.log.info("Antigravity warm path missed; running account-scoped print report", metadata: [
+                "expectedAccount": AntigravityFetchLog.accountFingerprint(expectedAccountEmail),
+            ])
+            return try await accountScopedFetch()
+        }
+
+        Self.log.debug("Antigravity warm path missed; spawning ambient agy")
         return try await spawnFetch(binary, idleWindow, resetAfterFetch)
+    }
+
+    /// Account-scoped `agy` usage report: stage the selected account's OAuth tokens into an
+    /// isolated `HOME` where `agy` uses file token storage (no Keychain reads or prompts), then
+    /// run the print report under that environment. Print reports carry no identity, so the
+    /// staged account's email is attached to let the downstream selected-account guard accept
+    /// the result; the account binding is guaranteed by the staged token itself.
+    private func fetchAccountScopedReport(
+        credentials: AntigravityOAuthCredentials,
+        accountKey: String,
+        binary: String,
+        environment: [String: String],
+        expectedAccountEmail: String?) async throws -> ProviderFetchResult
+    {
+        Self.log.info("Antigravity account-scoped report start", metadata: [
+            "accountKey": accountKey,
+            "expectedAccount": AntigravityFetchLog.accountFingerprint(
+                expectedAccountEmail ?? credentials.resolvedAccountEmail),
+        ])
+        do {
+            let result = try await self.homeCoordinator.withPreparedScope(
+                credentials: credentials,
+                accountKey: accountKey)
+            { scope in
+                var scopedEnvironment = environment
+                for (key, value) in scope.environment {
+                    scopedEnvironment[key] = value
+                }
+                let result = try await self.fetchPrintUsage(
+                    binary: binary,
+                    environment: scopedEnvironment)
+                guard let expectedAccountEmail else { return result }
+                let usage = result.usage.withIdentity(ProviderIdentitySnapshot(
+                    providerID: .antigravity,
+                    accountEmail: expectedAccountEmail,
+                    accountOrganization: result.usage.identity?.accountOrganization,
+                    loginMethod: result.usage.identity?.loginMethod))
+                return ProviderFetchResult(
+                    usage: usage,
+                    credits: result.credits,
+                    dashboard: result.dashboard,
+                    sourceLabel: result.sourceLabel,
+                    strategyID: result.strategyID,
+                    strategyKind: result.strategyKind,
+                    supplementalUsageTask: result.supplementalUsageTask,
+                    diagnostic: result.diagnostic)
+            }
+            Self.log.info("Antigravity account-scoped report succeeded", metadata: [
+                "accountKey": accountKey,
+                "usage": AntigravityFetchLog.usageSummary(result.usage),
+            ])
+            return result
+        } catch {
+            Self.log.warning("Antigravity account-scoped report failed", metadata: [
+                "accountKey": accountKey,
+                "error": error.localizedDescription,
+            ])
+            throw error
+        }
     }
 
     /// Spawn (or reuse CodexBar's own warm) `agy` session and wait for the CLI
@@ -845,6 +1048,7 @@ struct AntigravityCLIHTTPSFetchStrategy: ProviderFetchStrategy {
 struct AntigravityOAuthFetchStrategy: ProviderFetchStrategy {
     let id: String = "antigravity.oauth"
     let kind: ProviderFetchKind = .oauth
+    private static let log = CodexBarLog.logger(LogCategories.provider(.antigravity))
 
     func isAvailable(_: ProviderFetchContext) async -> Bool {
         true
@@ -881,11 +1085,24 @@ struct AntigravityOAuthFetchStrategy: ProviderFetchStrategy {
                 let token = try AntigravityOAuthCredentialsStore.tokenAccountValue(for: credentials)
                 await updater(.antigravity, accountID, token)
             })
-        let snapshot = try await fetcher.fetch()
-        let usage = try Self.usageSnapshot(from: snapshot)
-        return self.makeResult(
-            usage: usage,
-            sourceLabel: "oauth")
+        do {
+            let snapshot = try await fetcher.fetch()
+            let usage = try Self.usageSnapshot(from: snapshot)
+            Self.log.info("Antigravity OAuth fetch succeeded", metadata: [
+                "account": AntigravityFetchLog.accountFingerprint(usage.identity?.accountEmail),
+                "plan": usage.identity?.loginMethod ?? "none",
+                "quota": AntigravityFetchLog.statusSummary(snapshot),
+                "usage": AntigravityFetchLog.usageSummary(usage),
+            ])
+            return self.makeResult(
+                usage: usage,
+                sourceLabel: "oauth")
+        } catch {
+            Self.log.warning("Antigravity OAuth fetch failed", metadata: [
+                "error": error.localizedDescription,
+            ])
+            throw error
+        }
     }
 
     func shouldFallback(on _: Error, context: ProviderFetchContext) -> Bool {
@@ -904,6 +1121,7 @@ struct AntigravityOAuthFetchStrategy: ProviderFetchStrategy {
 struct AntigravityOfflineFetchStrategy: ProviderFetchStrategy {
     let id: String = "antigravity.offline"
     let kind: ProviderFetchKind = .localProbe
+    private static let log = CodexBarLog.logger(LogCategories.provider(.antigravity))
 
     func isAvailable(_ context: ProviderFetchContext) async -> Bool {
         // Cheap file existence check; no SQLite open.
@@ -918,6 +1136,9 @@ struct AntigravityOfflineFetchStrategy: ProviderFetchStrategy {
             .flatMap { $0.isEmpty ? nil : URL(fileURLWithPath: $0, isDirectory: true) }
             ?? FileManager.default.homeDirectoryForCurrentUser
         let count = AntigravityOfflineStore.countConversations(home: homeURL, env: context.env)
+        Self.log.debug("Antigravity offline fallback evaluated", metadata: [
+            "conversations": "\(count)",
+        ])
         guard count > 0 else {
             throw AntigravityStatusProbeError.notRunning
         }
@@ -980,12 +1201,18 @@ enum AntigravitySelectedAccountGuard {
     /// Email of the selected token account, read from the same injected
     /// credentials the OAuth strategy would use (`ANTIGRAVITY_OAUTH_CREDENTIALS_JSON`).
     static func selectedAccountEmail(context: ProviderFetchContext) -> String? {
+        self.selectedAccountCredentials(context: context)?.resolvedAccountEmail
+    }
+
+    /// Credentials of the selected token account, read from the same injected
+    /// credentials the OAuth strategy would use (`ANTIGRAVITY_OAUTH_CREDENTIALS_JSON`).
+    static func selectedAccountCredentials(context: ProviderFetchContext) -> AntigravityOAuthCredentials? {
         guard let value = context.env[AntigravityOAuthCredentialsStore.environmentCredentialsKey],
               let credentials = AntigravityOAuthCredentialsStore.credentials(fromTokenAccountValue: value)
         else {
             return nil
         }
-        return credentials.resolvedAccountEmail
+        return credentials
     }
 
     private static func normalizedEmail(_ email: String?) -> String? {

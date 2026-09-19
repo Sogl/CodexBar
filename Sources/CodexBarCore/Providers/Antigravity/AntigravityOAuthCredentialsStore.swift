@@ -167,7 +167,36 @@ public enum AntigravityOAuthConfig {
         if let client = environmentClient() {
             return client
         }
-        return Self.discoverClientFromInstalledApp()
+        let appClient = Self.discoverClientFromInstalledApp()
+        return Self.discoverClientFromAgyBinary(ideClient: appClient) ?? appClient
+    }
+
+    /// The `agy` CLI carries its own OAuth client pair next to the Antigravity app pair it
+    /// also understands. Quota eligibility and onboarding are bound to the client that minted
+    /// the credential: `agy`-backed fetching needs the CLI pair, because credentials minted by
+    /// the app pair fail `agy`'s eligibility check and the remote quota endpoints.
+    static func discoverClientFromAgyBinary(
+        binaryPath: String? = BinaryLocator.resolveAntigravityBinary(),
+        ideClient: AntigravityOAuthClient? = nil,
+        fileManager _: FileManager = .default) -> AntigravityOAuthClient?
+    {
+        guard let binaryPath,
+              let data = try? Data(
+                  contentsOf: URL(fileURLWithPath: binaryPath),
+                  options: [.mappedIfSafe])
+        else { return nil }
+
+        var clientIDs = Self.clientIDs(in: data)
+        var clientSecrets = Self.clientSecrets(in: data)
+        if let ideClient {
+            clientIDs.removeAll { $0 == ideClient.clientID }
+            clientSecrets.removeAll { $0 == ideClient.clientSecret }
+        }
+        // Google binaries store the secret table in reverse order relative to the client id
+        // table; in the `agy` binary the CLI's own login client is the trailing id, so it
+        // pairs with the leading secret. Removing the app pair keeps this unambiguous.
+        guard let clientID = clientIDs.last, let clientSecret = clientSecrets.first else { return nil }
+        return AntigravityOAuthClient(clientID: clientID, clientSecret: clientSecret)
     }
 
     private static func environmentClient() -> AntigravityOAuthClient? {

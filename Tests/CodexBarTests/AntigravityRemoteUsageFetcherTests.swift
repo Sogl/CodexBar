@@ -593,6 +593,76 @@ struct AntigravityRemoteUsageFetcherTests {
     }
 
     @Test
+    func `remote fetch classifies quota eligibility rejection`() async throws {
+        let env = try GeminiTestEnvironment()
+        defer { env.cleanup() }
+        try env.writeAntigravityCredentials(
+            accessToken: "token",
+            refreshToken: nil,
+            expiry: Date().addingTimeInterval(3600),
+            idToken: GeminiAPITestHelpers.makeIDToken(email: "user@example.com"),
+            email: "user@example.com")
+
+        let dataLoader = GeminiAPITestHelpers.dataLoader { request in
+            guard let url = request.url, let host = url.host else {
+                throw URLError(.badURL)
+            }
+
+            switch host {
+            case "cloudcode-pa.googleapis.com":
+                if url.path == "/v1internal:loadCodeAssist" {
+                    return GeminiAPITestHelpers.response(
+                        url: url.absoluteString,
+                        status: 200,
+                        body: GeminiAPITestHelpers.loadCodeAssistResponse(
+                            tierId: "standard-tier",
+                            projectId: "managed-project-123"))
+                }
+                if url.path == "/v1internal:fetchAvailableModels" {
+                    return GeminiAPITestHelpers.response(
+                        url: url.absoluteString,
+                        status: 200,
+                        body: GeminiAPITestHelpers.jsonData([
+                            "models": [
+                                "gemini-2.5-pro": [
+                                    "displayName": "Gemini 2.5 Pro",
+                                    "quotaInfo": ["remainingFraction": 1],
+                                ],
+                            ],
+                        ]))
+                }
+                if url.path == "/v1internal:retrieveUserQuota" {
+                    return GeminiAPITestHelpers.response(
+                        url: url.absoluteString,
+                        status: 403,
+                        body: GeminiAPITestHelpers.jsonData([
+                            "error": [
+                                "message": "Client is not eligible for Gemini Code Assist "
+                                    + "for individuals. Client does not support Google TOS.",
+                            ],
+                        ]))
+                }
+                return GeminiAPITestHelpers.response(url: url.absoluteString, status: 404, body: Data())
+            default:
+                return GeminiAPITestHelpers.response(url: url.absoluteString, status: 404, body: Data())
+            }
+        }
+
+        do {
+            _ = try await AntigravityRemoteUsageFetcher(
+                timeout: 1,
+                homeDirectory: env.homeURL.path,
+                dataLoader: dataLoader)
+                .fetch()
+            Issue.record("Expected eligibility rejection")
+        } catch let error as AntigravityRemoteFetchError {
+            #expect(error == .accountNotEligible)
+        } catch {
+            Issue.record("Unexpected error: \(error)")
+        }
+    }
+
+    @Test
     func `remote fetch keeps full quotas when verified quota endpoint has fractions`() async throws {
         let env = try GeminiTestEnvironment()
         defer { env.cleanup() }

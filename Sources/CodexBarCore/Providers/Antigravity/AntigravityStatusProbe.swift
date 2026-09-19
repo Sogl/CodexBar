@@ -769,6 +769,7 @@ public enum AntigravityStatusProbeError: LocalizedError, Sendable, Equatable {
     case parseFailed(String)
     case timedOut
     case authenticationRequired
+    case cliAccountNotEligible
     case accountMismatch(expected: String?, found: String?)
 
     public var errorDescription: String? {
@@ -787,6 +788,10 @@ public enum AntigravityStatusProbeError: LocalizedError, Sendable, Equatable {
             "Antigravity quota request timed out."
         case .authenticationRequired:
             "Antigravity CLI is signed out. Run agy in a terminal to sign in, then retry."
+        case .cliAccountNotEligible:
+            "Antigravity rejected this account's credentials: the account has not accepted the "
+                + "Gemini Code Assist terms for the OAuth client that issued them. Remove and "
+                + "re-add the account, or sign in with the agy CLI once to onboard it."
         case let .accountMismatch(expected, found):
             Self.accountMismatchDescription(expected: expected, found: found)
         }
@@ -818,6 +823,31 @@ public enum AntigravityStatusProbeError: LocalizedError, Sendable, Equatable {
             return "Antigravity session expired. Restart Antigravity and retry."
         }
         return "Antigravity API error: \(message)"
+    }
+
+    /// Google's signature for a credential minted by an OAuth client the account has not
+    /// onboarded for, as seen in `agy` stderr and remote Code Assist 403 bodies.
+    static func isEligibilityFailure(_ text: String) -> Bool {
+        let normalized = text.lowercased()
+        return normalized.contains("not eligible")
+            || normalized.contains("does not support google tos")
+            || normalized.contains("eligibility check failed")
+    }
+
+    /// Maps `agy` usage-report stderr to a typed error. Raw subprocess output is never
+    /// surfaced as a provider diagnostic; only known signatures are classified.
+    static func usageReportFailure(stderr: String) -> AntigravityStatusProbeError {
+        let normalized = stderr.lowercased()
+        if Self.isEligibilityFailure(normalized) {
+            return .cliAccountNotEligible
+        }
+        if normalized.contains("authentication required")
+            || normalized.contains("not logged")
+            || normalized.contains("sign in")
+        {
+            return .authenticationRequired
+        }
+        return .parseFailed("CLI usage report failed")
     }
 }
 
