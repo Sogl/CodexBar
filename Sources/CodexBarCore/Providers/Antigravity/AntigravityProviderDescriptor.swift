@@ -810,7 +810,17 @@ struct AntigravityCLIHTTPSFetchStrategy: ProviderFetchStrategy {
             Self.log.info("Antigravity warm path missed; running account-scoped print report", metadata: [
                 "expectedAccount": AntigravityFetchLog.accountFingerprint(expectedAccountEmail),
             ])
-            return try await accountScopedFetch()
+            do {
+                return try await accountScopedFetch()
+            } catch {
+                try Task.checkCancellation()
+                if error is CancellationError { throw error }
+                // Print reports need agy 1.1.11+; on older or unrecognized builds the scoped
+                // report always fails, so the identity-checked ambient spawn must stay reachable.
+                Self.log.debug(
+                    "Antigravity account-scoped report failed; falling back to ambient spawn",
+                    metadata: ["error": error.localizedDescription])
+            }
         }
 
         Self.log.debug("Antigravity warm path missed; spawning ambient agy")

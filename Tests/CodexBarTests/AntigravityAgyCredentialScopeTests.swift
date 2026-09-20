@@ -849,6 +849,67 @@ struct AntigravityAgyCredentialScopeTests {
         #expect(spawnCallCount.value == 0)
     }
 
+    /// When the account-scoped report fails (for example agy is older than the print-report
+    /// minimum), the identity-checked ambient spawn fallback still runs for the selected account.
+    @Test
+    func `account scoped fetch failure falls back to ambient spawn`() async throws {
+        let strategy = AntigravityCLIHTTPSFetchStrategy()
+        let spawnCallCount = AntigravityScopeCounter()
+        let scopedCallCount = AntigravityScopeCounter()
+
+        let result = try await strategy.fetchUsingWarmSession(
+            binary: "/usr/local/bin/agy",
+            idleWindow: 60,
+            resetAfterFetch: false,
+            expectedAccountEmail: "selected@example.com",
+            accountScopedFetch: {
+                scopedCallCount.increment()
+                throw AntigravityStatusProbeError.parseFailed(
+                    "CLI usage reports require agy 1.1.11 or later")
+            },
+            warmDependencies: Self.makeWarmDependencies(),
+            spawnFetch: { _, _, _ in
+                spawnCallCount.increment()
+                return strategy.makeResult(
+                    usage: Self.makeUsage(email: "selected@example.com"),
+                    sourceLabel: "cli")
+            })
+
+        #expect(result.usage.identity?.accountEmail == "selected@example.com")
+        #expect(scopedCallCount.value == 1)
+        #expect(spawnCallCount.value == 1)
+    }
+
+    /// Cancellation from the account-scoped fetch must propagate, not fall back to spawning.
+    @Test
+    func `account scoped fetch cancellation does not spawn`() async throws {
+        let strategy = AntigravityCLIHTTPSFetchStrategy()
+        let spawnCallCount = AntigravityScopeCounter()
+        let scopedCallCount = AntigravityScopeCounter()
+
+        await #expect(throws: CancellationError.self) {
+            _ = try await strategy.fetchUsingWarmSession(
+                binary: "/usr/local/bin/agy",
+                idleWindow: 60,
+                resetAfterFetch: false,
+                expectedAccountEmail: "selected@example.com",
+                accountScopedFetch: {
+                    scopedCallCount.increment()
+                    throw CancellationError()
+                },
+                warmDependencies: Self.makeWarmDependencies(),
+                spawnFetch: { _, _, _ in
+                    spawnCallCount.increment()
+                    return strategy.makeResult(
+                        usage: Self.makeUsage(email: "selected@example.com"),
+                        sourceLabel: "cli")
+                })
+        }
+
+        #expect(scopedCallCount.value == 1)
+        #expect(spawnCallCount.value == 0)
+    }
+
     /// Without a selected account the ambient spawn path is unchanged.
     @Test
     func `no selected account keeps ambient spawn path`() async throws {
