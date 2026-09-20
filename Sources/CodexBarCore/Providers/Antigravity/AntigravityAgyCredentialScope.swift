@@ -156,10 +156,15 @@ final class AntigravityAgyCredentialMutationLock: AntigravityAgyCredentialMutati
             close(fd)
         }
 
-        while flock(fd, LOCK_EX) != 0 {
-            guard errno == EINTR else {
-                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        // Nonblocking acquisition: waiters suspend instead of occupying a cooperative
+        // worker while the holder awaits subprocesses, and Task.sleep makes the wait
+        // cancellation-aware so a cancelled refresh can abandon the queue.
+        while flock(fd, LOCK_EX | LOCK_NB) != 0 {
+            let lockError = errno
+            guard lockError == EWOULDBLOCK || lockError == EINTR else {
+                throw POSIXError(POSIXErrorCode(rawValue: lockError) ?? .EIO)
             }
+            try await Task.sleep(for: .milliseconds(25))
         }
         return try await operation()
     }
@@ -197,6 +202,10 @@ actor AntigravityAgyHomeCoordinator {
     private let mutationLock: any AntigravityAgyCredentialMutationLocking
     private let resetSession: @Sendable () async -> Void
     private let accountsDirectory: URL
+    /// Account keys tombstoned by `removeScope(accountKey:)`. Tombstoned scopes can
+    /// never be restaged in this process, so a queued fan-out refresh cannot
+    /// recreate credentials after the saved account was deleted.
+    private var retiredAccountKeys: Set<String> = []
 
     init(
         fileManager: FileManager = .default,
@@ -224,11 +233,25 @@ actor AntigravityAgyHomeCoordinator {
         accountKey: String,
         operation: @Sendable (AntigravityAgyScopedEnvironment) async throws -> T) async throws -> T
     {
+        guard !self.retiredAccountKeys.contains(accountKey) else {
+            Self.log.info("agy scope: staging skipped, account scope removed", metadata: [
+                "accountKey": accountKey,
+            ])
+            throw AntigravityAgyHomeScopeError.unavailable("account scope was removed")
+        }
         let fileManager = UncheckedSendableFileManager(value: self.fileManager)
         let accountsDirectory = self.accountsDirectory
         let resetSession = self.resetSession
         Self.log.debug("agy scope: waiting for mutation lock", metadata: ["accountKey": accountKey])
         return try await self.mutationLock.withLock {
+            // Re-check under the lock: the account may have been removed while this
+            // fetch was queued behind another scoped session.
+            if await self.isScopeRetired(accountKey) {
+                Self.log.info("agy scope: staging blocked for removed account", metadata: [
+                    "accountKey": accountKey,
+                ])
+                throw AntigravityAgyHomeScopeError.unavailable("account scope was removed")
+            }
             // Ensure a previous CodexBar-managed agy session (possibly for another account)
             // is gone before the scoped spawn, and again after it completes.
             await resetSession()
@@ -257,15 +280,52 @@ actor AntigravityAgyHomeCoordinator {
         }
     }
 
+    /// Deletes the staged home for `accountKey` and tombstones the scope so queued or
+    /// in-flight staging cannot recreate credentials for a removed saved account.
+    /// Deletion is serialized with staging behind the mutation lock: a scoped fetch
+    /// already running finishes first, then its staged home is removed.
+    func removeScope(accountKey: String) async {
+        self.retiredAccountKeys.insert(accountKey)
+        let fileManager = UncheckedSendableFileManager(value: self.fileManager)
+        let directory = Self.accountDirectory(
+            accountKey: accountKey,
+            accountsDirectory: self.accountsDirectory)
+        do {
+            try await self.mutationLock.withLock {
+                if fileManager.value.fileExists(atPath: directory.path) {
+                    try fileManager.value.removeItem(at: directory)
+                }
+            }
+            Self.log.info("agy scope: staged home removed", metadata: ["accountKey": accountKey])
+        } catch {
+            Self.log.warning("agy scope: could not remove staged home", metadata: [
+                "accountKey": accountKey,
+                "error": error.localizedDescription,
+            ])
+        }
+    }
+
+    private func isScopeRetired(_ accountKey: String) -> Bool {
+        self.retiredAccountKeys.contains(accountKey)
+    }
+
     func prepare(
         credentials: AntigravityOAuthCredentials,
         accountKey: String) throws -> AntigravityAgyScopedEnvironment
     {
-        try Self.prepare(
+        guard !self.retiredAccountKeys.contains(accountKey) else {
+            throw AntigravityAgyHomeScopeError.unavailable("account scope was removed")
+        }
+        return try Self.prepare(
             credentials: credentials,
             accountKey: accountKey,
             fileManager: self.fileManager,
             accountsDirectory: self.accountsDirectory)
+    }
+
+    static func accountDirectory(accountKey: String, accountsDirectory: URL) -> URL {
+        accountsDirectory
+            .appendingPathComponent(self.sanitizedDirectoryComponent(accountKey), isDirectory: true)
     }
 
     static func prepare(
@@ -284,8 +344,9 @@ actor AntigravityAgyHomeCoordinator {
             throw AntigravityAgyHomeScopeError.credentialsMissingRequiredFields
         }
 
-        let homeURL = accountsDirectory
-            .appendingPathComponent(Self.sanitizedDirectoryComponent(accountKey), isDirectory: true)
+        let homeURL = Self.accountDirectory(
+            accountKey: accountKey,
+            accountsDirectory: accountsDirectory)
             .appendingPathComponent("home", isDirectory: true)
         do {
             try fileManager.createDirectory(
@@ -355,5 +416,16 @@ actor AntigravityAgyHomeCoordinator {
         let sanitized = value.unicodeScalars.map { allowed.contains($0) ? Character($0) : "-" }
         let trimmed = String(sanitized).trimmingCharacters(in: CharacterSet(charactersIn: "-"))
         return trimmed.isEmpty ? "account" : String(trimmed.prefix(64))
+    }
+}
+
+/// App-facing lifecycle hook for the internal scope coordinator. Kept deliberately
+/// narrow: the saved-account removal path is the only supported caller.
+public enum AntigravityAgyScopedHomeLifecycle {
+    /// Deletes the staged credential home for `accountKey` (the saved account's UUID
+    /// string) and blocks queued or in-flight staging from recreating it after the
+    /// account was removed from settings.
+    public static func removeScope(accountKey: String) async {
+        await AntigravityAgyHomeCoordinator.shared.removeScope(accountKey: accountKey)
     }
 }

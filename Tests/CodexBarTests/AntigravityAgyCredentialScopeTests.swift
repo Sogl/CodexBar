@@ -70,6 +70,22 @@ private final class AntigravitySessionResetRecorder: @unchecked Sendable {
     }
 }
 
+private actor AntigravityAsyncGate {
+    private var isOpen = false
+    private var waiter: CheckedContinuation<Void, Never>?
+
+    func wait() async {
+        guard !self.isOpen else { return }
+        await withCheckedContinuation { self.waiter = $0 }
+    }
+
+    func open() {
+        self.isOpen = true
+        self.waiter?.resume()
+        self.waiter = nil
+    }
+}
+
 private final class AntigravityScopeCounter: @unchecked Sendable {
     private let lock = NSLock()
     private var count = 0
@@ -140,6 +156,22 @@ struct AntigravityAgyCredentialScopeTests {
             .appendingPathComponent("agy-scope-tests-" + UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         return url
+    }
+
+    /// DirectoryEnumerator is unavailable from async contexts; kept synchronous.
+    private static func stagedFilePaths(under directory: URL) throws -> [String] {
+        guard let enumerator = FileManager.default.enumerator(
+            at: directory,
+            includingPropertiesForKeys: [.isDirectoryKey])
+        else { return [] }
+        var files: [String] = []
+        for case let url as URL in enumerator {
+            let isDirectory = try url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory ?? false
+            if !isDirectory {
+                files.append(url.path)
+            }
+        }
+        return files.sorted()
     }
 
     /// OAuth credentials encode into the `fileTokenStorage` payload `agy` reads.
@@ -375,6 +407,182 @@ struct AntigravityAgyCredentialScopeTests {
         #expect(homeB.contains("/b/"))
         let maximumConcurrentLocks = await lock.maximumConcurrentLocks()
         #expect(maximumConcurrentLocks == 1)
+    }
+
+    /// The production flock-based lock must suspend waiters instead of blocking a
+    /// cooperative worker, and a cancelled waiter must abandon the wait promptly.
+    /// A second waiter acquires the lock once the holder is cancelled.
+    @Test
+    func `real mutation lock releases cancelled waiters and reacquires`() async throws {
+        let lockFileURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("agy-real-lock-" + UUID().uuidString, isDirectory: true)
+            .appendingPathComponent("scope.lock")
+        defer { try? FileManager.default.removeItem(at: lockFileURL.deletingLastPathComponent()) }
+        let lock = AntigravityAgyCredentialMutationLock(fileURL: lockFileURL)
+        let entered = AntigravityScopeCounter()
+
+        let holder = Task {
+            try await lock.withLock {
+                entered.increment()
+                try await Task.sleep(for: .seconds(60))
+                return "held"
+            }
+        }
+        while entered.value == 0 {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+
+        // A waiter blocked in a synchronous flock() could never observe cancellation;
+        // with the suspending wait it must finish promptly once cancelled.
+        let waiter = Task {
+            try await lock.withLock { "acquired" }
+        }
+        try await Task.sleep(for: .milliseconds(150))
+        waiter.cancel()
+        let waiterFinished = await withTaskGroup(of: Bool.self) { group in
+            group.addTask {
+                _ = await waiter.result
+                return true
+            }
+            group.addTask {
+                try? await Task.sleep(for: .seconds(5))
+                return false
+            }
+            let first = await group.next() ?? false
+            group.cancelAll()
+            return first
+        }
+        #expect(waiterFinished)
+
+        // The lock stays usable: a later waiter acquires it after the holder releases.
+        let latecomer = Task {
+            try await lock.withLock { "latecomer" }
+        }
+        holder.cancel()
+        #expect(try await latecomer.value == "latecomer")
+        _ = await holder.result
+    }
+
+    /// Removing an account deletes its staged home and tombstones the scope so
+    /// neither `prepare` nor `withPreparedScope` can restage credentials for it.
+    @Test
+    func `removeScope deletes staged home and blocks restaging`() async throws {
+        let accountsDirectory = try Self.makeAccountsDirectory()
+        defer { try? FileManager.default.removeItem(at: accountsDirectory) }
+        let coordinator = AntigravityAgyHomeCoordinator(
+            mutationLock: FakeAntigravityAgyCredentialMutationLock(),
+            resetSession: {},
+            accountsDirectory: accountsDirectory)
+        let accountKey = "account-removed"
+
+        let scope = try await coordinator.prepare(
+            credentials: Self.validCredentials(),
+            accountKey: accountKey)
+        let homeURL = try #require(scope.homeURL)
+        #expect(FileManager.default.fileExists(atPath: homeURL.path))
+
+        await coordinator.removeScope(accountKey: accountKey)
+        #expect(!FileManager.default.fileExists(atPath: homeURL.path))
+
+        await #expect(throws: AntigravityAgyHomeScopeError.self) {
+            try await coordinator.prepare(
+                credentials: Self.validCredentials(),
+                accountKey: accountKey)
+        }
+        await #expect(throws: AntigravityAgyHomeScopeError.self) {
+            try await coordinator.withPreparedScope(
+                credentials: Self.validCredentials(),
+                accountKey: accountKey)
+            { _ in "never" }
+        }
+        #expect(!FileManager.default.fileExists(atPath: homeURL.path))
+    }
+
+    /// A fetch queued behind another scoped session must not restage credentials
+    /// once its account was removed while it waited on the lock.
+    @Test
+    func `queued staging cannot restage a removed account`() async throws {
+        let accountsDirectory = try Self.makeAccountsDirectory()
+        defer { try? FileManager.default.removeItem(at: accountsDirectory) }
+        let coordinator = AntigravityAgyHomeCoordinator(
+            mutationLock: FakeAntigravityAgyCredentialMutationLock(),
+            resetSession: {},
+            accountsDirectory: accountsDirectory)
+        let removedKey = "account-queued"
+        let gate = AntigravityAsyncGate()
+        let firstEntered = AntigravityScopeCounter()
+
+        let first = Task {
+            try await coordinator.withPreparedScope(
+                credentials: Self.validCredentials(),
+                accountKey: "account-first")
+            { _ in
+                firstEntered.increment()
+                await gate.wait()
+                return "first"
+            }
+        }
+        while firstEntered.value == 0 {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+
+        let queued = Task {
+            try await coordinator.withPreparedScope(
+                credentials: Self.validCredentials(),
+                accountKey: removedKey)
+            { _ in "restaged" }
+        }
+        // Let the queued fetch reach the lock wait, then remove the account. The
+        // tombstone lands immediately even though the deletion queues on the lock.
+        let removal = Task { await coordinator.removeScope(accountKey: removedKey) }
+        try await Task.sleep(for: .milliseconds(100))
+        await gate.open()
+
+        await #expect(throws: AntigravityAgyHomeScopeError.self) {
+            try await queued.value
+        }
+        #expect(try await first.value == "first")
+        await removal.value
+        let removedHome = AntigravityAgyHomeCoordinator.accountDirectory(
+            accountKey: removedKey,
+            accountsDirectory: accountsDirectory)
+            .appendingPathComponent("home", isDirectory: true)
+        #expect(!FileManager.default.fileExists(atPath: removedHome.path))
+    }
+
+    /// The staged home is the only credential source the scoped `agy` can see: a
+    /// fresh scope contains exactly the file-token payload for the staged account,
+    /// and the environment pins file-based storage so ambient credentials cannot
+    /// leak into the scope.
+    @Test
+    func `staged home exposes only the scoped account token`() async throws {
+        let accountsDirectory = try Self.makeAccountsDirectory()
+        defer { try? FileManager.default.removeItem(at: accountsDirectory) }
+        let coordinator = AntigravityAgyHomeCoordinator(
+            mutationLock: FakeAntigravityAgyCredentialMutationLock(),
+            resetSession: {},
+            accountsDirectory: accountsDirectory)
+
+        let scope = try await coordinator.prepare(
+            credentials: Self.validCredentials(email: "selected@example.com"),
+            accountKey: "account-isolated")
+        let homeURL = try #require(scope.homeURL)
+        let tokenURL = AntigravityAgyHomeCoordinator.tokenURL(home: homeURL)
+
+        // Enumerated paths resolve the /var -> /private/var symlink, so compare by
+        // suffix: exactly one file, inside the account's staged home, at the agy
+        // file-token location.
+        let stagedFiles = try Self.stagedFilePaths(under: homeURL)
+        #expect(stagedFiles.count == 1)
+        #expect(stagedFiles.first?.hasSuffix(
+            "/" + AntigravityAgyHomeCoordinator.tokenRelativePath.joined(separator: "/")) == true)
+        #expect(stagedFiles.first?.contains("/account-isolated/home/") == true)
+
+        let tokenData = try #require(FileManager.default.contents(atPath: tokenURL.path))
+        let payload = try #require(AntigravityAgyFileTokenEncoder.decode(data: tokenData))
+        #expect(payload.token.refreshToken == "test-refresh-token")
+        #expect(scope.environment["HOME"] == homeURL.path)
+        #expect(scope.environment["SSH_TTY"]?.isEmpty == false)
     }
 
     /// A warm ambient `agy` that already matches the selected account is reused; neither the

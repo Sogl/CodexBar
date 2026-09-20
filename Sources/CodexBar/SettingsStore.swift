@@ -250,6 +250,8 @@ final class SettingsStore {
     @ObservationIgnored let userDefaults: UserDefaults
     @ObservationIgnored let configStore: CodexBarConfigStore
     @ObservationIgnored let antigravityOAuthCredentialsStore: AntigravityOAuthCredentialsStore
+    /// Removes a removed account's scoped `agy` staging home; injectable for tests.
+    @ObservationIgnored let antigravityScopedHomeRemover: @Sendable (String) async -> Void
     @ObservationIgnored let keychainAccessPolicy: SettingsStoreKeychainAccessPolicy
     @ObservationIgnored var config: CodexBarConfig
     @ObservationIgnored var configPersistTask: Task<Void, Never>?
@@ -320,6 +322,9 @@ final class SettingsStore {
         copilotTokenStore: any CopilotTokenStoring = KeychainCopilotTokenStore(),
         tokenAccountStore: any ProviderTokenAccountStoring = FileTokenAccountStore(),
         antigravityOAuthCredentialsStore: AntigravityOAuthCredentialsStore = AntigravityOAuthCredentialsStore(),
+        antigravityScopedHomeRemover: @escaping @Sendable (String) async -> Void = { accountKey in
+            await AntigravityAgyScopedHomeLifecycle.removeScope(accountKey: accountKey)
+        },
         keychainAccessPolicy: SettingsStoreKeychainAccessPolicy = .live,
         performInitialProviderDetection: Bool = !SettingsStore.isRunningTests)
     {
@@ -377,6 +382,7 @@ final class SettingsStore {
         self.userDefaults = userDefaults
         self.configStore = configStore
         self.antigravityOAuthCredentialsStore = antigravityOAuthCredentialsStore
+        self.antigravityScopedHomeRemover = antigravityScopedHomeRemover
         self.keychainAccessPolicy = keychainAccessPolicy
         self.config = config
         self.configLoading = true

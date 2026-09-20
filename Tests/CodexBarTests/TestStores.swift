@@ -229,6 +229,7 @@ func testSettingsStore(
     tokenAccountStore: any ProviderTokenAccountStoring = InMemoryTokenAccountStore(),
     config: CodexBarConfig? = nil,
     keychainAccessPolicy: SettingsStoreKeychainAccessPolicy = .live,
+    antigravityScopedHomeRemover: @escaping @Sendable (String) async -> Void = { _ in },
     prepareDefaults: ((UserDefaults) -> Void)? = nil) -> SettingsStore
 {
     let isolatedSuiteName = "\(suiteName)-\(UUID().uuidString)"
@@ -262,6 +263,7 @@ func testSettingsStore(
         ampCookieStore: InMemoryCookieHeaderStore(),
         copilotTokenStore: InMemoryCopilotTokenStore(),
         tokenAccountStore: tokenAccountStore,
+        antigravityScopedHomeRemover: antigravityScopedHomeRemover,
         keychainAccessPolicy: keychainAccessPolicy)
 }
 

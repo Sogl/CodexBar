@@ -278,6 +278,11 @@ extension SettingsStore {
     {
         // Provider-specific by design: removing the final Antigravity account must delete its shared OAuth cache.
         guard provider == .antigravity else { return }
+        // The scoped staging home holds reusable OAuth tokens, so it must be deleted
+        // whenever the account is removed — independent of the shared-cache matching below.
+        let scopeRemover = self.antigravityScopedHomeRemover
+        let accountKey = removedAccount.id.uuidString
+        Task { await scopeRemover(accountKey) }
         guard let removedCredentials = AntigravityOAuthCredentialsStore.credentials(
             fromTokenAccountValue: removedAccount.token)
         else {
