@@ -550,6 +550,164 @@ struct AntigravityAgyCredentialScopeTests {
         #expect(!FileManager.default.fileExists(atPath: removedHome.path))
     }
 
+    /// Retirement must reach every process sharing the accounts directory: a second
+    /// coordinator (e.g. a `codexbar` CLI invocation) has an empty in-memory tombstone
+    /// set, yet the persisted marker must still block restaging of the removed account.
+    @Test
+    func `removeScope blocks restaging from another coordinator sharing the directory`() async throws {
+        let accountsDirectory = try Self.makeAccountsDirectory()
+        defer { try? FileManager.default.removeItem(at: accountsDirectory) }
+        let lockFileURL = accountsDirectory.appendingPathComponent("shared-scope.lock")
+        let appCoordinator = AntigravityAgyHomeCoordinator(
+            mutationLock: AntigravityAgyCredentialMutationLock(fileURL: lockFileURL),
+            resetSession: {},
+            accountsDirectory: accountsDirectory)
+        let cliCoordinator = AntigravityAgyHomeCoordinator(
+            mutationLock: AntigravityAgyCredentialMutationLock(fileURL: lockFileURL),
+            resetSession: {},
+            accountsDirectory: accountsDirectory)
+        let accountKey = "account-removed-remotely"
+
+        let scope = try await appCoordinator.prepare(
+            credentials: Self.validCredentials(),
+            accountKey: accountKey)
+        let homeURL = try #require(scope.homeURL)
+        await appCoordinator.removeScope(accountKey: accountKey)
+        #expect(!FileManager.default.fileExists(atPath: homeURL.path))
+
+        // The other coordinator never saw the removal, but the shared marker blocks it.
+        await #expect(throws: AntigravityAgyHomeScopeError.self) {
+            try await cliCoordinator.withPreparedScope(
+                credentials: Self.validCredentials(),
+                accountKey: accountKey)
+            { _ in "never" }
+        }
+        await #expect(throws: AntigravityAgyHomeScopeError.self) {
+            try await cliCoordinator.prepare(
+                credentials: Self.validCredentials(),
+                accountKey: accountKey)
+        }
+        #expect(!FileManager.default.fileExists(atPath: homeURL.path))
+
+        // Retirement stays scoped to the removed key: unrelated accounts still stage.
+        let otherScope = try await cliCoordinator.prepare(
+            credentials: Self.validCredentials(),
+            accountKey: "account-still-saved")
+        #expect(otherScope.homeURL != nil)
+    }
+
+    /// The exact review scenario: a fetch in a second process captured the account,
+    /// waited behind the app's scoped session on the shared lock, and acquired the
+    /// lock only after the app removed the account. The persisted marker must reject
+    /// it before any credential file is restaged.
+    @Test
+    func `queued staging in another coordinator cannot restage a removed account`() async throws {
+        let accountsDirectory = try Self.makeAccountsDirectory()
+        defer { try? FileManager.default.removeItem(at: accountsDirectory) }
+        let lockFileURL = accountsDirectory.appendingPathComponent("shared-scope.lock")
+        let appCoordinator = AntigravityAgyHomeCoordinator(
+            mutationLock: AntigravityAgyCredentialMutationLock(fileURL: lockFileURL),
+            resetSession: {},
+            accountsDirectory: accountsDirectory)
+        let cliCoordinator = AntigravityAgyHomeCoordinator(
+            mutationLock: AntigravityAgyCredentialMutationLock(fileURL: lockFileURL),
+            resetSession: {},
+            accountsDirectory: accountsDirectory)
+        let removedKey = "account-queued-remotely"
+        let markerURL = AntigravityAgyHomeCoordinator.retiredMarkerURL(
+            accountKey: removedKey,
+            accountsDirectory: accountsDirectory)
+        let gate = AntigravityAsyncGate()
+        let holderEntered = AntigravityScopeCounter()
+
+        // The app process holds the shared lock on an unrelated scoped fetch.
+        let holder = Task {
+            try await appCoordinator.withPreparedScope(
+                credentials: Self.validCredentials(),
+                accountKey: "account-holder")
+            { _ in
+                holderEntered.increment()
+                await gate.wait()
+                return "held"
+            }
+        }
+        while holderEntered.value == 0 {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+
+        // The CLI process captured the account before removal and queues on the lock.
+        #expect(!FileManager.default.fileExists(atPath: markerURL.path))
+        let queued = Task {
+            try await cliCoordinator.withPreparedScope(
+                credentials: Self.validCredentials(),
+                accountKey: removedKey)
+            { _ in "restaged" }
+        }
+        try await Task.sleep(for: .milliseconds(100))
+
+        // The app removes the account; the marker lands before the delete waits on the lock.
+        let removal = Task { await appCoordinator.removeScope(accountKey: removedKey) }
+        while !FileManager.default.fileExists(atPath: markerURL.path) {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        await gate.open()
+
+        await #expect(throws: AntigravityAgyHomeScopeError.self) {
+            try await queued.value
+        }
+        #expect(try await holder.value == "held")
+        await removal.value
+        let removedHome = AntigravityAgyHomeCoordinator.accountDirectory(
+            accountKey: removedKey,
+            accountsDirectory: accountsDirectory)
+            .appendingPathComponent("home", isDirectory: true)
+        #expect(!FileManager.default.fileExists(atPath: removedHome.path))
+    }
+
+    /// If a removal crashes between writing the marker and deleting the directory,
+    /// the next scoped operation in any process sweeps the leftover staged home
+    /// instead of leaving reusable tokens behind.
+    @Test
+    func `first scoped operation sweeps staged home left by interrupted removal`() async throws {
+        let accountsDirectory = try Self.makeAccountsDirectory()
+        defer { try? FileManager.default.removeItem(at: accountsDirectory) }
+        let lockFileURL = accountsDirectory.appendingPathComponent("shared-scope.lock")
+        let crashedCoordinator = AntigravityAgyHomeCoordinator(
+            mutationLock: AntigravityAgyCredentialMutationLock(fileURL: lockFileURL),
+            resetSession: {},
+            accountsDirectory: accountsDirectory)
+        let otherCoordinator = AntigravityAgyHomeCoordinator(
+            mutationLock: AntigravityAgyCredentialMutationLock(fileURL: lockFileURL),
+            resetSession: {},
+            accountsDirectory: accountsDirectory)
+        let retiredKey = "account-crashed-removal"
+
+        let scope = try await crashedCoordinator.prepare(
+            credentials: Self.validCredentials(),
+            accountKey: retiredKey)
+        let staleHomeURL = try #require(scope.homeURL)
+
+        // Simulate the crash window: marker persisted, directory deletion never ran.
+        let markerURL = AntigravityAgyHomeCoordinator.retiredMarkerURL(
+            accountKey: retiredKey,
+            accountsDirectory: accountsDirectory)
+        try FileManager.default.createDirectory(
+            at: markerURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true)
+        try Data("\(retiredKey)\n".utf8).write(to: markerURL)
+        #expect(FileManager.default.fileExists(atPath: staleHomeURL.path))
+
+        // The other process's first scoped fetch sweeps the retired home under the lock.
+        let unrelated = try await otherCoordinator.withPreparedScope(
+            credentials: Self.validCredentials(),
+            accountKey: "account-alive")
+        { scope in scope.homeURL?.path ?? "" }
+
+        #expect(!unrelated.isEmpty)
+        #expect(!FileManager.default.fileExists(atPath: staleHomeURL.path))
+        #expect(FileManager.default.fileExists(atPath: markerURL.path))
+    }
+
     /// The staged home is the only credential source the scoped `agy` can see: a
     /// fresh scope contains exactly the file-token payload for the staged account,
     /// and the environment pins file-based storage so ambient credentials cannot

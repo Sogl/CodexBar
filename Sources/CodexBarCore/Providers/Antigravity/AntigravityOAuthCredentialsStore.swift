@@ -163,12 +163,31 @@ public enum AntigravityOAuthConfig {
         ANTIGRAVITY_OAUTH_CLIENT_ID and ANTIGRAVITY_OAUTH_CLIENT_SECRET before logging in.
         """
 
+    /// Client preference for minting new credentials at login: the agy client is
+    /// preferred because `agy`-backed fetching rejects app-minted credentials.
     public static func resolvedClient() -> AntigravityOAuthClient? {
         if let client = environmentClient() {
             return client
         }
         let appClient = Self.discoverClientFromInstalledApp()
         return Self.discoverClientFromAgyBinary(ideClient: appClient) ?? appClient
+    }
+
+    /// Refresh fallback for credentials saved before the minting client was persisted:
+    /// those grants were issued to the installed app's OAuth client, so they must keep
+    /// refreshing with it. New logins pin their minting client into the stored credential
+    /// fields and never reach this fallback, so the agy-first login preference must not
+    /// leak into legacy refresh resolution.
+    public static func legacyRefreshClient(
+        applicationRoots: [URL]? = nil,
+        fileManager: FileManager = .default) -> AntigravityOAuthClient?
+    {
+        if let client = environmentClient() {
+            return client
+        }
+        return Self.discoverClientFromInstalledApp(
+            applicationRoots: applicationRoots,
+            fileManager: fileManager)
     }
 
     /// The `agy` CLI carries its own OAuth client pair next to the Antigravity app pair it

@@ -966,6 +966,77 @@ struct AntigravityRemoteUsageFetcherTests {
         }
     }
 
+    /// Credentials saved before the minting client was persisted carry no client
+    /// fields: their expired grant must refresh through the legacy fallback resolver
+    /// (the installed app's client), not the agy-first login preference.
+    @Test
+    func `remote refresh of legacy grant without client fields uses fallback resolver`() async throws {
+        let env = try GeminiTestEnvironment()
+        defer { env.cleanup() }
+        try env.writeAntigravityCredentials(
+            accessToken: "old-token",
+            refreshToken: "legacy-refresh",
+            expiry: Date().addingTimeInterval(-3600),
+            idToken: GeminiAPITestHelpers.makeIDToken(email: "stale@example.com"),
+            email: "stale@example.com")
+
+        let legacyClient = AntigravityOAuthClient(
+            clientID: "legacy-app-client-id",
+            clientSecret: "legacy-app-client-secret")
+        let dataLoader = GeminiAPITestHelpers.dataLoader { request in
+            guard let url = request.url, let host = url.host else {
+                throw URLError(.badURL)
+            }
+
+            switch host {
+            case "oauth2.googleapis.com":
+                let body = try #require(request.httpBody)
+                #expect(try FormBodyTestSupport.decode(body) == [
+                    "client_id": "legacy-app-client-id",
+                    "client_secret": "legacy-app-client-secret",
+                    "refresh_token": "legacy-refresh",
+                    "grant_type": "refresh_token",
+                ])
+                return GeminiAPITestHelpers.response(
+                    url: url.absoluteString,
+                    status: 200,
+                    body: GeminiAPITestHelpers.jsonData([
+                        "access_token": "new-token",
+                        "expires_in": 3600,
+                        "id_token": GeminiAPITestHelpers.makeIDToken(email: "refreshed@example.com"),
+                    ]))
+            case "cloudcode-pa.googleapis.com":
+                if url.path == "/v1internal:loadCodeAssist" {
+                    return GeminiAPITestHelpers.response(
+                        url: url.absoluteString,
+                        status: 200,
+                        body: GeminiAPITestHelpers.jsonData([
+                            "currentTier": ["id": "standard-tier", "name": "standard"],
+                            "cloudaicompanionProject": "managed-project-123",
+                        ]))
+                }
+                if url.path == "/v1internal:fetchAvailableModels" {
+                    return GeminiAPITestHelpers.response(
+                        url: url.absoluteString,
+                        status: 200,
+                        body: Self.availableModelsResponse())
+                }
+                return GeminiAPITestHelpers.response(url: url.absoluteString, status: 404, body: Data())
+            default:
+                return GeminiAPITestHelpers.response(url: url.absoluteString, status: 404, body: Data())
+            }
+        }
+
+        let fetcher = AntigravityRemoteUsageFetcher(
+            timeout: 2,
+            homeDirectory: env.homeURL.path,
+            dataLoader: dataLoader,
+            oauthClientResolver: { legacyClient })
+        let snapshot = try await fetcher.fetch()
+
+        #expect(snapshot.accountEmail == "refreshed@example.com")
+    }
+
     @Test
     func `remote fetch onboards project before fetching models`() async throws {
         let env = try GeminiTestEnvironment()

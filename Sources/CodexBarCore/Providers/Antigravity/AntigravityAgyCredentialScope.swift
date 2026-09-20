@@ -197,6 +197,9 @@ actor AntigravityAgyHomeCoordinator {
     static let tokenRelativePath = [".gemini", "antigravity-cli", "antigravity-oauth-token"]
     /// Any non-empty value triggers `agy`'s "SSH session detected" file-storage path.
     static let sshSessionMarkerValue = "/dev/ttys001"
+    /// Retirement markers live on the shared filesystem so every process using the same
+    /// accounts directory — the app and any `codexbar` CLI invocation — observes removal.
+    static let retiredMarkersDirectoryName = ".retired"
 
     private let fileManager: FileManager
     private let mutationLock: any AntigravityAgyCredentialMutationLocking
@@ -204,8 +207,13 @@ actor AntigravityAgyHomeCoordinator {
     private let accountsDirectory: URL
     /// Account keys tombstoned by `removeScope(accountKey:)`. Tombstoned scopes can
     /// never be restaged in this process, so a queued fan-out refresh cannot
-    /// recreate credentials after the saved account was deleted.
+    /// recreate credentials after the saved account was deleted. The marker file is
+    /// the cross-process source of truth; this set is the same-process fast path.
     private var retiredAccountKeys: Set<String> = []
+    /// Each process sweeps stale retired homes once, under the lock, before its first
+    /// scoped operation: a removal that crashed between writing the marker and deleting
+    /// the directory still completes instead of leaving reusable tokens on disk.
+    private var didReconcileRetiredScopes = false
 
     init(
         fileManager: FileManager = .default,
@@ -233,7 +241,7 @@ actor AntigravityAgyHomeCoordinator {
         accountKey: String,
         operation: @Sendable (AntigravityAgyScopedEnvironment) async throws -> T) async throws -> T
     {
-        guard !self.retiredAccountKeys.contains(accountKey) else {
+        guard !self.isScopeRetired(accountKey) else {
             Self.log.info("agy scope: staging skipped, account scope removed", metadata: [
                 "accountKey": accountKey,
             ])
@@ -244,6 +252,11 @@ actor AntigravityAgyHomeCoordinator {
         let resetSession = self.resetSession
         Self.log.debug("agy scope: waiting for mutation lock", metadata: ["accountKey": accountKey])
         return try await self.mutationLock.withLock {
+            if await self.consumePendingReconciliation() {
+                Self.removeStaleRetiredHomes(
+                    fileManager: fileManager.value,
+                    accountsDirectory: accountsDirectory)
+            }
             // Re-check under the lock: the account may have been removed while this
             // fetch was queued behind another scoped session.
             if await self.isScopeRetired(accountKey) {
@@ -286,6 +299,9 @@ actor AntigravityAgyHomeCoordinator {
     /// already running finishes first, then its staged home is removed.
     func removeScope(accountKey: String) async {
         self.retiredAccountKeys.insert(accountKey)
+        // The marker lands before the deletion queues on the lock: any process that
+        // acquires the shared lock after the removal must already observe retirement.
+        self.persistRetirementMarker(accountKey: accountKey)
         let fileManager = UncheckedSendableFileManager(value: self.fileManager)
         let directory = Self.accountDirectory(
             accountKey: accountKey,
@@ -305,15 +321,75 @@ actor AntigravityAgyHomeCoordinator {
         }
     }
 
+    /// A scope is retired once its in-memory tombstone or its persisted marker exists.
+    /// The marker check runs under the mutation lock, so a queued fetch in a separate
+    /// process cannot restage credentials for an account another process removed.
     private func isScopeRetired(_ accountKey: String) -> Bool {
-        self.retiredAccountKeys.contains(accountKey)
+        if self.retiredAccountKeys.contains(accountKey) {
+            return true
+        }
+        return self.fileManager.fileExists(
+            atPath: Self.retiredMarkerURL(
+                accountKey: accountKey,
+                accountsDirectory: self.accountsDirectory).path)
+    }
+
+    private func consumePendingReconciliation() -> Bool {
+        guard !self.didReconcileRetiredScopes else { return false }
+        self.didReconcileRetiredScopes = true
+        return true
+    }
+
+    /// Marker filenames are sanitized account keys, so each one maps back to the
+    /// account directory it retires.
+    private static func removeStaleRetiredHomes(fileManager: FileManager, accountsDirectory: URL) {
+        let markersDirectory = accountsDirectory
+            .appendingPathComponent(Self.retiredMarkersDirectoryName, isDirectory: true)
+        guard let markers = try? fileManager.contentsOfDirectory(atPath: markersDirectory.path) else {
+            return
+        }
+        for marker in markers {
+            let directory = Self.accountDirectory(accountKey: marker, accountsDirectory: accountsDirectory)
+            guard fileManager.fileExists(atPath: directory.path) else { continue }
+            try? fileManager.removeItem(at: directory)
+            Self.log.info("agy scope: reconciled staged home of removed account", metadata: [
+                "accountKey": marker,
+            ])
+        }
+    }
+
+    private func persistRetirementMarker(accountKey: String) {
+        let markerURL = Self.retiredMarkerURL(
+            accountKey: accountKey,
+            accountsDirectory: self.accountsDirectory)
+        do {
+            try self.fileManager.createDirectory(
+                at: markerURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700])
+            if !self.fileManager.fileExists(atPath: markerURL.path) {
+                try Data("\(accountKey)\n".utf8).write(to: markerURL, options: [.atomic])
+            }
+            try self.fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: markerURL.path)
+        } catch {
+            Self.log.warning("agy scope: could not persist retirement marker", metadata: [
+                "accountKey": accountKey,
+                "error": error.localizedDescription,
+            ])
+        }
+    }
+
+    static func retiredMarkerURL(accountKey: String, accountsDirectory: URL) -> URL {
+        accountsDirectory
+            .appendingPathComponent(self.retiredMarkersDirectoryName, isDirectory: true)
+            .appendingPathComponent(self.sanitizedDirectoryComponent(accountKey))
     }
 
     func prepare(
         credentials: AntigravityOAuthCredentials,
         accountKey: String) throws -> AntigravityAgyScopedEnvironment
     {
-        guard !self.retiredAccountKeys.contains(accountKey) else {
+        guard !self.isScopeRetired(accountKey) else {
             throw AntigravityAgyHomeScopeError.unavailable("account scope was removed")
         }
         return try Self.prepare(

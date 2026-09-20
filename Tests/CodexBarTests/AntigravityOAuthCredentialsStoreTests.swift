@@ -272,6 +272,47 @@ struct AntigravityOAuthCredentialsStoreTests {
                 binaryPath: binaryURL.path) == nil)
     }
 
+    /// Credentials saved before the minting client was persisted carry no client
+    /// fields: their refresh fallback must resolve the installed app's OAuth client
+    /// (the grant's issuer), never the agy-first login preference.
+    @Test
+    func `legacy refresh client resolves installed app client`() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let appClient = AntigravityOAuthClient(
+            clientID: self.googleClientID("legacy-app"),
+            clientSecret: self.googleClientSecret(repeating: "l"))
+        try self.writeAntigravityApp(
+            named: "Antigravity.app",
+            under: root,
+            artifactRelativePath: "Contents/Resources/app/out/main.js",
+            artifactData: Data("""
+            out-build/vs/platform/cloudCode/common/oauthClient.js
+            clientId="\(appClient.clientID)";
+            clientSecret="\(appClient.clientSecret)";
+            """.utf8))
+
+        #expect(
+            AntigravityOAuthConfig.legacyRefreshClient(
+                applicationRoots: [root]) == appClient)
+    }
+
+    /// Without an installed app or env override the legacy fallback reports no
+    /// client, so refresh surfaces the existing "not configured" error.
+    @Test
+    func `legacy refresh client is nil without installed app`() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+
+        #expect(
+            AntigravityOAuthConfig.legacyRefreshClient(
+                applicationRoots: [root]) == nil)
+    }
+
     private func writeAntigravityApp(
         named name: String,
         under root: URL,

@@ -69,7 +69,7 @@ public struct AntigravityRemoteUsageFetcher: Sendable {
             try await ProviderHTTPClient.shared.data(for: request)
         },
         oauthClientResolver: @escaping @Sendable () -> AntigravityOAuthClient? = {
-            AntigravityOAuthConfig.resolvedClient()
+            AntigravityOAuthConfig.legacyRefreshClient()
         },
         credentialsUpdateHandler: @escaping @Sendable (AntigravityOAuthCredentials) async throws -> Void = { _ in })
     {
