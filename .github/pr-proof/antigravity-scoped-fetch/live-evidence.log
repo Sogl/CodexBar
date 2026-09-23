@@ -1,0 +1,93 @@
+# Live macOS proof — agy 1.2.9, CodexBarCLI built from this branch.
+# Ambient agy CLI login = account B (a***@gmail.com).
+# Scoped account A = p***@gmail.com, a different saved Google account.
+# Emails redacted; no credentials appear below.
+
+## 1. Production path: selected account A gets A's quota via the scoped spawn
+
+$ CodexBarCLI usage --provider antigravity --account p***@gmail.com --format json -v
+
+  debug  subprocess: binary=agy label=antigravity-cli-version status=0
+  debug  antigravity: Antigravity CLI HTTPS spawn skipped; agy local server requires a CSRF token
+  debug  subprocess: binary=agy label=antigravity-cli-version status=0
+  debug  subprocess: binary=agy label=antigravity-cli-scoped-usage status=0
+
+  Result: source=cli, accountEmail=p***@gmail.com
+    Gemini weekly     usedPercent=0    resetsAt=2026-09-30T13:07:31Z
+    Claude/GPT weekly usedPercent=100  resetsAt=2026-09-25T08:15:28Z
+
+  Ambient B's windows for contrast (raw `agy -p /usage` under real ~/.gemini):
+    Gemini weekly     usedPercent=0    resetsAt=2026-09-30T10:04:56Z
+    Claude/GPT weekly usedPercent=100  resetsAt=2026-09-23T14:58:41Z
+
+## 2. Auto mode without --account takes the same scoped path
+
+$ CodexBarCLI usage --provider antigravity --format json -v
+  (app-selected account = p***@gmail.com)
+
+  debug  subprocess: binary=agy label=antigravity-cli-scoped-usage status=0
+  Result: identical A windows, accountEmail=p***@gmail.com
+  No ambient report substituted although agy's ambient login is B.
+
+## 3. Revoked scoped credentials cannot substitute ambient B
+
+$ CodexBarCLI usage --account revoked-proof@example.com ...   (temporary fake entry, removed after)
+
+  warning subprocess: binary=agy label=antigravity-cli-scoped-usage status=1
+  strategies: antigravity.cli-https error=agy 1.2.2 or later requires a local CSRF token
+              antigravity.oauth    error=Antigravity Google auth not found
+  Result: source=offline, labeled revoked-proof@example.com.
+  The original ambient-path error is preserved; B's quota never appears.
+
+## 4. Manual staging boundary (what the scoped spawn does internally)
+
+Staged <tmp-home>/.gemini/antigravity-cli/antigravity-oauth-token for A, then:
+
+$ env -i HOME=<staged> PWD=<staged> SSH_TTY=codexbar-scoped PATH=... TMPDIR=... LANG=... \
+    agy -p /usage --output-format json --print-timeout 90s
+
+  <staged>/.gemini/antigravity-cli/log/cli-*.log:
+    server_oauth.go:196] applyAuthResult: email=p***@gmail.com, authMethod=consumer
+    server_oauth.go:201] OAuth: authenticated successfully as p***@gmail.com
+  exit=0, report = A's windows above.
+
+  Ambient ~/.gemini/antigravity-cli (614 files) snapshotted before/after:
+    files touched: NONE   |   ambient oauth-token touched: False
+
+  Same run with garbage access_token/refresh_token staged:
+    exit=1, stderr: Eligibility check failed: UNAUTHENTICATED (code 401)
+    Ambient B is logged in and healthy; no ambient fallback occurred.
+
+  Same run with token expiry forced to 2020-01-01:
+    exit=0, A's report returned; agy refreshed the grant and rewrote only the
+    staged token file (new access_token, expiry +1h, id_token preserved).
+
+## 5. Grant provenance: the tested account came from CodexBar "Add Account"
+
+All 4 saved token accounts in ~/.codexbar/config.json carry OAuth client_id
+  1071006060591-***.apps.googleusercontent.com
+CodexBar's Add Account flow resolves its OAuth client by discovering it from
+the installed /Applications/Antigravity.app
+(AntigravityOAuthConfig.discoverClientFromInstalledApp). That app binary
+contains exactly two OAuth client IDs and the saved grants use the primary
+one — i.e. these are CodexBar-minted grants under Antigravity's own client,
+not tokens copied out of agy's state.
+
+## 6. Production expired-grant run: scoped attempt fails closed, OAuth recovers
+
+$ CodexBarCLI usage --provider antigravity --account p***@gmail.com --format json -v
+  (saved expiry_date forced to the past for this run; restored after)
+
+  Run 1: antigravity-cli-scoped-usage hit the 90s timeout while agy attempted
+         to refresh the expired grant
+  Run 2: antigravity-cli-scoped-usage status=1 in ~17s
+  strategies: antigravity.cli-https error=agy 1.2.2 or later requires a local CSRF token
+  Result: source=oauth, accountEmail=p***@gmail.com, A's quota windows
+    Gemini weekly resetsAt=2026-09-30T13:07:31Z
+
+  The scoped attempt fails closed within the timeout bound, the original
+  ambient-path error is preserved in the diagnostics, and the account-scoped
+  OAuth strategy recovers with A's data labeled A. Ambient B never appears.
+  (In-run token refresh via agy for this grant was unreliable in the staged
+  environment — observed once as a stall, once as an exit-1 — which is why the
+  account-scoped OAuth fallback exists.)
