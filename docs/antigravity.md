@@ -45,6 +45,17 @@ The report contains no account or plan identity: explicit CLI mode remains autho
 this fallback only without a selected token account or explicitly injected OAuth credentials. Successful
 HTTPS results retain their verified identity. Failed command diagnostics do not include raw stderr.
 
+On macOS, when a Google account is selected or injected in Auto mode and the ambient paths cannot prove
+that account, CodexBar instead runs the same print command scoped to the account: its OAuth credentials
+are written as `agy`'s file-token payload into a fresh private `HOME` under the per-user temporary
+directory, the staged `id_token` claim is re-read from disk and verified against the selected account
+before launch, and the child process receives an allowlist environment (login `PATH`, locale, proxy
+variables) without `ANTIGRAVITY_OAUTH_CREDENTIALS_JSON` or any ambient provider credentials. A non-empty
+`SSH_TTY` forces `agy` onto file-token storage so the scoped run never touches the OS keyring. The
+staging directory is deleted after the run, a report carrying conflicting identity is rejected, and any
+scoped failure preserves the original ambient error — an ambient report is never substituted for a
+selected account, so the pipeline falls through to the account-scoped OAuth fetch exactly as before.
+
 If live sources fail and local conversation history is available, CodexBar labels the result as offline and
 shows a safe explanation of the live failure in settings and CLI usage output. CLI failures distinguish sign-in,
 eligibility, and network problems without exposing stderr, URLs, or account emails. Offline conversation counts

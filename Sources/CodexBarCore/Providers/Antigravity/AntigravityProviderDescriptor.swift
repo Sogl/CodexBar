@@ -523,6 +523,13 @@ struct AntigravityCLIHTTPSFetchStrategy: ProviderFetchStrategy {
         } else {
             nil
         }
+        #if os(macOS)
+        let scopedReportFetch: (@Sendable () async throws -> ProviderFetchResult)? = {
+            try await self.fetchScopedPrintUsage(binary: binary, environment: context.env)
+        }
+        #else
+        let scopedReportFetch: (@Sendable () async throws -> ProviderFetchResult)? = nil
+        #endif
         return try await Self.fetchWithReportFallback(
             context: context,
             legacyFetch: {
@@ -539,13 +546,16 @@ struct AntigravityCLIHTTPSFetchStrategy: ProviderFetchStrategy {
                         }
                     })
             },
-            reportFetch: { try await self.fetchPrintUsage(binary: binary, environment: context.env) })
+            reportFetch: { try await self.fetchPrintUsage(binary: binary, environment: context.env) },
+            scopedReportFetch: scopedReportFetch)
     }
 
     static func fetchWithReportFallback(
         context: ProviderFetchContext,
         legacyFetch: @Sendable () async throws -> ProviderFetchResult,
-        reportFetch: @Sendable () async throws -> ProviderFetchResult) async throws -> ProviderFetchResult
+        reportFetch: @Sendable () async throws -> ProviderFetchResult,
+        scopedReportFetch: (@Sendable () async throws -> ProviderFetchResult)? = nil)
+        async throws -> ProviderFetchResult
     {
         do {
             let result = try await legacyFetch()
@@ -557,7 +567,19 @@ struct AntigravityCLIHTTPSFetchStrategy: ProviderFetchStrategy {
             // Identity-free reports must not replace a selected or injected OAuth account's fallback.
             guard context.sourceMode != .auto || (context.selectedTokenAccountID == nil &&
                 context.env[AntigravityOAuthCredentialsStore.environmentCredentialsKey] == nil)
-            else { throw error }
+            else {
+                // An ambient report cannot prove account identity, but a scoped run can:
+                // the staged token's verified `id_token` claim binds the report to the
+                // selected account. A scoped failure preserves the original error so the
+                // ambient-path diagnostic is not masked by secondary staging failures.
+                guard let scopedReportFetch else { throw error }
+                do {
+                    return try await scopedReportFetch()
+                } catch let scopedError {
+                    if scopedError is CancellationError { throw scopedError }
+                    throw error
+                }
+            }
         }
         return try await reportFetch()
     }
