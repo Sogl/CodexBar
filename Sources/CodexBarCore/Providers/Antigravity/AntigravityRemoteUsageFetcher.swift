@@ -216,7 +216,10 @@ public struct AntigravityRemoteUsageFetcher: Sendable {
                     projectId: projectId,
                     timeout: timeout,
                     dataLoader: dataLoader)
-                guard let quotaBuckets, Self.hasQuotaFractionData(quotaBuckets) else {
+                guard let quotaBuckets else {
+                    return modelQuotas
+                }
+                guard Self.hasQuotaFractionData(quotaBuckets) else {
                     return []
                 }
                 return Self.mergeVerifiedQuotas(modelQuotas: modelQuotas, verifiedQuotas: quotaBuckets)
